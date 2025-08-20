@@ -192,9 +192,9 @@ impl std::fmt::Display for EntityType {
 }
 
 /// Unique ID for an entity. These represent entities in the AST.
-#[derive(Educe, Serialize, Deserialize, Debug, Clone)]
+#[derive(Educe, Serialize, Deserialize, Clone)]
 #[serde(rename = "EntityUID")]
-#[educe(PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[educe(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct EntityUIDImpl {
     /// Typename of the entity
     ty: EntityType,
@@ -205,6 +205,7 @@ pub struct EntityUIDImpl {
     #[educe(PartialEq(ignore))]
     #[educe(Hash(ignore))]
     #[educe(PartialOrd(ignore))]
+    #[educe(Debug(ignore))]
     loc: MaybeLoc,
 }
 
