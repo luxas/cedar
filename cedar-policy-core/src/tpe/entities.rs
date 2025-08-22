@@ -354,12 +354,6 @@ impl PartialEntity {
         let etype = uid.entity_type();
 
         if self.uid.is_action() {
-            if self.attrs.is_none() || self.tags.is_none() {
-                return Err(UnknownActionComponentError {
-                    action: uid.clone(),
-                }
-                .into());
-            }
             if let Some(attrs) = &self.attrs {
                 if let Some((attr, _)) = attrs.first_key_value() {
                     return Err(EntitySchemaConformanceError::unexpected_entity_attr(
