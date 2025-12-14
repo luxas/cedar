@@ -52,17 +52,12 @@ pub struct Authorizer {
 /// We currently only have one mode: [`ErrorHandling::Skip`].
 /// Other modes were debated during development, so this is here as an easy
 /// way to add modes if the future if we so decide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ErrorHandling {
     /// If a policy encounters an evaluation error, skip it.  The decision will
     /// be as if the erroring policy did not exist.
+    #[default]
     Skip,
-}
-
-impl Default for ErrorHandling {
-    fn default() -> Self {
-        Self::Skip
-    }
 }
 
 impl Authorizer {

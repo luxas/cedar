@@ -23,7 +23,6 @@ use thiserror::Error;
 use std::fmt::Display;
 
 use crate::fuzzy_match::fuzzy_search;
-use crate::impl_diagnostic_from_source_loc_opt_field;
 use crate::parser::MaybeLoc;
 
 use std::collections::BTreeSet;
