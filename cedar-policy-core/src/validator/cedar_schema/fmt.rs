@@ -24,8 +24,8 @@ use miette::Diagnostic;
 use nonempty::NonEmpty;
 use thiserror::Error;
 
+use crate::ast::InternalName;
 use crate::validator::{json_schema, RawName};
-use crate::{ast::InternalName, impl_diagnostic_from_method_on_nonempty_field};
 
 /// Number of spaces of indentation per level in the Cedarschema file
 pub const NUM_INDENTATION_SPACES: usize = 2;
