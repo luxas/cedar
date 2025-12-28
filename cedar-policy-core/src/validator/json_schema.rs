@@ -498,8 +498,10 @@ impl<'de, N: Deserialize<'de> + From<RawName>> Deserialize<'de> for EntityType<N
         D: serde::Deserializer<'de>,
     {
         // A "real" option that does not accept `null` during deserialization
+        #[derive(Default)]
         enum RealOption<T> {
             Some(T),
+            #[default]
             None,
         }
         impl<'de, T: Deserialize<'de>> Deserialize<'de> for RealOption<T> {
@@ -508,11 +510,6 @@ impl<'de, N: Deserialize<'de> + From<RawName>> Deserialize<'de> for EntityType<N
                 D: Deserializer<'de>,
             {
                 T::deserialize(deserializer).map(Self::Some)
-            }
-        }
-        impl<T> Default for RealOption<T> {
-            fn default() -> Self {
-                Self::None
             }
         }
 
