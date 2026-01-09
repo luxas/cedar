@@ -23,7 +23,7 @@ use crate::ast::{Annotations, Effect, EntityUID, Literal, Policy, PolicyID, Valu
 #[cfg(feature = "tolerant-ast")]
 use crate::tpe::err::ErrorNotSupportedError;
 use crate::tpe::err::{
-    ExprToResidualError, MissingTypeAnnotationError, SlotNotSupportedError,
+    ExprToResidualError, SlotNotSupportedError,
     UnknownNotSupportedError,
 };
 use crate::validator::types::Type;
@@ -40,20 +40,16 @@ pub enum Residual {
     Partial {
         /// The kind of partial expression
         kind: ResidualKind,
-        /// Type of the partial expression
-        ty: Type,
     },
     /// TPE produces a concrete value
     Concrete {
         /// The concrete value
         value: Value,
-        /// Type of the value
-        ty: Type,
     },
     /// TPE produces a (typed) error
     /// Evaluating the residual of this variant always produces an evaluation
     /// error. The error kind does not matter for the sake of re-authorization.
-    Error(Type),
+    Error,
 }
 
 impl Residual {
@@ -73,18 +69,18 @@ impl Residual {
         match self {
             Residual::Partial { kind, .. } => kind.all_literal_uids(),
             Residual::Concrete { value, .. } => value.all_literal_uids(),
-            Residual::Error(_) => HashSet::new(),
+            Residual::Error => HashSet::new(),
         }
     }
 
-    /// Get the type of this residual
-    pub fn ty(&self) -> &Type {
+    // Get the type of this residual
+    /*pub fn ty(&self) -> &Type {
         match self {
             Residual::Partial { ty, .. } => ty,
             Residual::Concrete { ty, .. } => ty,
             Residual::Error(ty) => ty,
         }
-    }
+    }*/
 }
 
 impl TryFrom<Residual> for Value {
@@ -100,8 +96,6 @@ impl TryFrom<Residual> for Value {
 impl TryFrom<&Expr<Option<Type>>> for Residual {
     type Error = ExprToResidualError;
     fn try_from(expr: &Expr<Option<Type>>) -> std::result::Result<Self, ExprToResidualError> {
-        let ty = expr.data().clone().ok_or(MissingTypeAnnotationError)?;
-
         // Otherwise, convert to a partial residual
         let kind = match expr.expr_kind() {
             ast::ExprKind::Var(var) => ResidualKind::Var(*var),
@@ -169,7 +163,7 @@ impl TryFrom<&Expr<Option<Type>>> for Residual {
             // Literals should be converted to concrete values
             ast::ExprKind::Lit(lit) => {
                 let value = Value::new(lit.clone(), None);
-                return Ok(Residual::Concrete { value, ty });
+                return Ok(Residual::Concrete { value });
             }
             // These are not supported in residuals
             ast::ExprKind::Slot(_) => return Err(SlotNotSupportedError.into()),
@@ -180,7 +174,7 @@ impl TryFrom<&Expr<Option<Type>>> for Residual {
             }
         };
 
-        Ok(Residual::Partial { kind, ty })
+        Ok(Residual::Partial { kind })
     }
 }
 
@@ -442,7 +436,7 @@ impl From<Residual> for Expr {
                 }
             }
             Residual::Concrete { value, .. } => value.into(),
-            Residual::Error(_) => {
+            Residual::Error => {
                 let builder: ast::ExprBuilder<()> = ExprBuilder::with_data(());
                 #[expect(clippy::unwrap_used, reason = "`error` is a valid `Name`")]
                 builder.call_extension_fn("error".parse().unwrap(), std::iter::empty())
