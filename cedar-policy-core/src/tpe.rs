@@ -22,6 +22,7 @@ pub mod evaluator;
 pub mod request;
 pub mod residual;
 pub mod response;
+mod test;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -173,6 +174,16 @@ permit (
   resource.owner == principal &&
   context.srcIP.isInRange(ip("1.1.1.0/24"))
 };
+
+@id("3")
+// Test policy that checks if the principal is in the set of users.
+permit (
+  principal,
+  action,
+  resource
+) when {
+  (resource.isPublic && resource.level + 1 == 2) && 3 == 1+1
+};
         "#,
         )
         .unwrap()
@@ -185,7 +196,8 @@ permit (
 
 entity Document  = {
   "isPublic": Bool,
-  "owner": User
+  "owner": User,
+  "level": Long
 };
 
 action View appliesTo {
@@ -264,6 +276,10 @@ action Delete appliesTo {
             .static_policies()
             .find(|p| matches!(p.annotation(&id), Some(Annotation {val, ..}) if val == "2"))
             .unwrap();
+        let policy3 = policies
+            .static_policies()
+            .find(|p| matches!(p.annotation(&id), Some(Annotation {val, ..}) if val == "3"))
+            .unwrap();
         // resource["isPublic"]
         assert_matches!(residuals.get_residual(policy0.id()), Some(Residual::Partial{kind: ResidualKind::GetAttr { expr, attr }, ..}) => {
             assert_matches!(expr.as_ref(), Residual::Partial { kind: ResidualKind::Var(Var::Resource), .. });
@@ -285,6 +301,17 @@ action Delete appliesTo {
             Some(Residual::Concrete {
                 value: Value {
                     value: ValueKind::Lit(Literal::Bool(false)),
+                    ..
+                },
+                ..
+            })
+        );
+        // false
+        assert_matches!(
+            residuals.get_residual(policy3.id()),
+            Some(Residual::Concrete {
+                value: Value {
+                    value: ValueKind::Lit(Literal::Bool(true)),
                     ..
                 },
                 ..

@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::ast::{Annotations, Effect, EntityUID, Literal, Policy, PolicyID, ValueKind};
+use crate::ast::{Annotations, Effect, EntityUID, Literal, Policy, PolicyID, StaticallyTyped, ValueKind};
 #[cfg(feature = "tolerant-ast")]
 use crate::tpe::err::ErrorNotSupportedError;
 use crate::tpe::err::{
@@ -85,6 +85,81 @@ impl Residual {
             Residual::Error(ty) => ty,
         }
     }
+
+    pub fn can_error_assuming_well_formed(&self) -> bool {
+        match self {
+            // TODO: Is it guaranteed that a concrete value always matches its type? No, but that does not yield errors.
+            Residual::Concrete { .. } => false,
+            // TODO: Extend this function to express the set of possible bool outcomes
+            Residual::Error(_) => true,
+            Residual::Partial { kind, .. } => match kind {
+                // Keep the same structure here as in tpe::Evaluator::interpret
+                // Variables are either kept unknown or converted into an EntityUID or Context value
+                ResidualKind::Var(_) => false,
+                ResidualKind::And { left, right } => {
+                    // TODO: Add here 
+                    left.can_error_assuming_well_formed() || right.can_error_assuming_well_formed()
+                }
+                ResidualKind::BinaryApp { op, arg1, arg2 } => match op {
+                    // Arithmetic operations could error
+                    ast::BinaryOp::Add => true,
+                    ast::BinaryOp::Mul => true,
+                    ast::BinaryOp::Sub => true,
+    
+                    // These operations only error if their sub-expr does
+                    ast::BinaryOp::Contains => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                    ast::BinaryOp::ContainsAll => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                    ast::BinaryOp::ContainsAny => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                    ast::BinaryOp::Eq => arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed(),
+                    ast::BinaryOp::GetTag => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                    ast::BinaryOp::HasTag => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                    ast::BinaryOp::In => arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed(),
+                    ast::BinaryOp::Less => arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed(),
+                    ast::BinaryOp::LessEq => {
+                        arg1.can_error_assuming_well_formed() || arg2.can_error_assuming_well_formed()
+                    }
+                },
+                // Extension functions could error
+                ResidualKind::ExtensionFunctionApp { .. } => true,
+    
+                ResidualKind::GetAttr { expr, .. } => expr.can_error_assuming_well_formed(),
+                ResidualKind::HasAttr { expr, .. } => expr.can_error_assuming_well_formed(),
+    
+                ResidualKind::If {
+                    test_expr,
+                    then_expr,
+                    else_expr,
+                } => {
+                    test_expr.can_error_assuming_well_formed() ||
+                    then_expr.can_error_assuming_well_formed() ||
+                    else_expr.can_error_assuming_well_formed()
+                }
+                ResidualKind::Is { expr, .. } => expr.can_error_assuming_well_formed(),
+                ResidualKind::Like { expr, .. } => expr.can_error_assuming_well_formed(),
+                ResidualKind::Or { left, right } => {
+                    left.can_error_assuming_well_formed() || right.can_error_assuming_well_formed()
+                }
+                ResidualKind::Record(attrs) => attrs.iter().any(|(_, e)| e.can_error_assuming_well_formed()),
+    
+                ResidualKind::Set(items) => items.iter().any(Self::can_error_assuming_well_formed),
+                ResidualKind::UnaryApp { op, arg } => match op {
+                    ast::UnaryOp::IsEmpty => arg.can_error_assuming_well_formed(),
+                    ast::UnaryOp::Neg => true,
+                    ast::UnaryOp::Not => arg.can_error_assuming_well_formed(),
+                },
+            },
+        }
+    }
 }
 
 impl TryFrom<Residual> for Value {
@@ -100,6 +175,8 @@ impl TryFrom<Residual> for Value {
 impl TryFrom<&Expr<Option<Type>>> for Residual {
     type Error = ExprToResidualError;
     fn try_from(expr: &Expr<Option<Type>>) -> std::result::Result<Self, ExprToResidualError> {
+        // TODO: If we know from the validator that the type is a singleton True or False, we could
+        // just disregard the expr itself and just cast into a concrete true/false residual.
         let ty = expr.data().clone().ok_or(MissingTypeAnnotationError)?;
 
         // Otherwise, convert to a partial residual
@@ -114,6 +191,7 @@ impl TryFrom<&Expr<Option<Type>>> for Residual {
                 then_expr: Arc::new(Self::try_from(then_expr.as_ref())?),
                 else_expr: Arc::new(Self::try_from(else_expr.as_ref())?),
             },
+            // TODO: Could add a safety check here to force ty to be a primitive bool
             ast::ExprKind::And { left, right } => ResidualKind::And {
                 left: Arc::new(Self::try_from(left.as_ref())?),
                 right: Arc::new(Self::try_from(right.as_ref())?),
@@ -490,6 +568,14 @@ mod test {
                 panic!("unexpected type error in expression");
             }
         }
+    }
+
+    #[test]
+    fn entity_in_set() {
+        assert_eq!(
+            parse_residual("principal").all_literal_uids(),
+            HashSet::new()
+        );
     }
 
     mod literal_uids {

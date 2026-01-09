@@ -50,7 +50,6 @@ impl Evaluator<'_> {
     /// into a `ResidualKind::Error`
     #[expect(clippy::cognitive_complexity, reason = "experimental feature")]
     pub fn interpret(&self, r: &Residual) -> Residual {
-        let ty = r.ty().clone();
         let kind = match r {
             Residual::Concrete { .. } => {
                 return r.clone();
@@ -58,8 +57,9 @@ impl Evaluator<'_> {
             Residual::Error(_) => {
                 return r.clone();
             }
-            Residual::Partial { kind, ty: _ty } => kind,
+            Residual::Partial { kind, .. } => kind,
         };
+        let ty = r.ty().clone();
         match kind {
             ResidualKind::Var(Var::Action) => Residual::Concrete {
                 value: self.request.action.clone().into(),
@@ -126,6 +126,7 @@ impl Evaluator<'_> {
                             },
                         ..
                     } => self.interpret(right),
+                    // never possible on well-typed residuals
                     Residual::Concrete { ty, .. } => Residual::Error(ty.clone()),
                     Residual::Partial { .. } => match &self.interpret(right) {
                         Residual::Concrete {
@@ -136,6 +137,34 @@ impl Evaluator<'_> {
                                 },
                             ..
                         } => left,
+                        Residual::Concrete {
+                            value:
+                                Value {
+                                    value: ValueKind::Lit(ast::Literal::Bool(false)),
+                                    ..
+                                },
+                            ..
+                        } => {
+                            if !left.can_error_assuming_well_formed() {
+                                // simplify <non_erroring_residual> && false == false
+                                Residual::Concrete {
+                                    value: false.into(),
+                                    ty,
+                                }
+                            } else {
+                                // cannot simplify <erroring_residual> && false
+                                Residual::Partial {
+                                    kind: ResidualKind::And {
+                                        left: Arc::new(left),
+                                        right: Arc::new(Residual::Concrete {
+                                            value: false.into(),
+                                            ty: ty.clone(),
+                                        }),
+                                    },
+                                    ty,
+                                }
+                            }
+                        },
                         right => Residual::Partial {
                             kind: ResidualKind::And {
                                 left: Arc::new(left),
@@ -144,6 +173,7 @@ impl Evaluator<'_> {
                             ty,
                         },
                     },
+                    // propagate error upwards from left expr to AND expr
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -169,6 +199,7 @@ impl Evaluator<'_> {
                             },
                         ..
                     } => self.interpret(right),
+                    // never possible on well-typed residuals
                     Residual::Concrete { ty, .. } => Residual::Error(ty.clone()),
                     Residual::Partial { .. } => match &self.interpret(right) {
                         Residual::Concrete {
@@ -179,6 +210,34 @@ impl Evaluator<'_> {
                                 },
                             ..
                         } => left,
+                        Residual::Concrete {
+                            value:
+                                Value {
+                                    value: ValueKind::Lit(ast::Literal::Bool(true)),
+                                    ..
+                                },
+                            ..
+                        } => {
+                            if !left.can_error_assuming_well_formed() {
+                                // simplify <error-free> || true == true
+                                Residual::Concrete {
+                                    value: true.into(),
+                                    ty,
+                                }
+                            } else {
+                                // cannot simplify <non-error-free> || true
+                                Residual::Partial {
+                                    kind: ResidualKind::Or {
+                                        left: Arc::new(left),
+                                        right: Arc::new(Residual::Concrete {
+                                            value: true.into(),
+                                            ty: ty.clone(),
+                                        }),
+                                    },
+                                    ty,
+                                }
+                            }
+                        },
                         right => Residual::Partial {
                             kind: ResidualKind::Or {
                                 left: Arc::new(left),
@@ -187,6 +246,7 @@ impl Evaluator<'_> {
                             ty,
                         },
                     },
+                    // propagate error upwards from left expr to OR expr
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -211,7 +271,10 @@ impl Evaluator<'_> {
                             self.interpret(else_expr)
                         }
                     }
+                    // never possible on well-typed residuals
                     Residual::Concrete { ty, .. } => Residual::Error(ty.clone()),
+                    // TODO: Could use equality between then_expr and else_expr here to fold if equal, but only if
+                    // cond is error-free.
                     Residual::Partial { .. } => Residual::Partial {
                         kind: ResidualKind::If {
                             test_expr: Arc::new(cond),
@@ -220,6 +283,7 @@ impl Evaluator<'_> {
                         },
                         ty,
                     },
+                    // propagate error upwards from test expr to if-then-else expr
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -237,6 +301,7 @@ impl Evaluator<'_> {
                         value: (uid.entity_type() == entity_type).into(),
                         ty,
                     },
+                    // never possible on well-typed residuals
                     Residual::Concrete { ty, .. } => Residual::Error(ty.clone()),
                     Residual::Partial {
                         kind: ResidualKind::Var(Var::Principal),
@@ -259,6 +324,7 @@ impl Evaluator<'_> {
                         },
                         ty,
                     },
+                    // propagate error upwards from child expr to parent expr
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -276,6 +342,7 @@ impl Evaluator<'_> {
                         value: pattern.wildcard_match(s).into(),
                         ty,
                     },
+                    // never possible on well-typed residuals
                     Residual::Concrete { ty, .. } => Residual::Error(ty.clone()),
                     Residual::Partial { .. } => Residual::Partial {
                         kind: ResidualKind::Like {
@@ -284,6 +351,7 @@ impl Evaluator<'_> {
                         },
                         ty,
                     },
+                    // propagate error upwards from child expr to parent expr
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -309,10 +377,14 @@ impl Evaluator<'_> {
                             {
                                 Residual::Concrete { value: v, ty }
                             } else {
+                                // TODO: Does the validator check operator overloading capabilities of extension functions?
+                                // e.g. datetime("abc") < (if principal.bla then datetime("abc") else datetime("def"))
+                                // One could be conservative in the sense that we always say that expressions with extension functions can error.
                                 Residual::Error(ty)
                             }
                         }
                         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                            // All of these can error at runtime, and are not checked by the validator.
                             if let Ok(v) =
                                 crate::evaluator::binary_arith(*op, v1.clone(), v2.clone(), None)
                             {
@@ -323,6 +395,7 @@ impl Evaluator<'_> {
                         }
                         BinaryOp::In => {
                             if let Ok(uid1) = v1.get_as_entity() {
+                                // TODO: How does transitive closure work in batched evaluation mode?
                                 if let Ok(uid2) = v2.get_as_entity() {
                                     if uid1 == uid2 {
                                         return Residual::Concrete {
@@ -337,6 +410,7 @@ impl Evaluator<'_> {
                                             };
                                         }
                                     }
+                                    // uid1 entity unknown, so we cannot know what ancestors it has.
                                     residual(arg1, arg2, ty)
                                 } else if let Ok(s) = v2.get_as_set() {
                                     if let Ok(uids) = s
@@ -344,38 +418,51 @@ impl Evaluator<'_> {
                                         .map(Value::get_as_entity)
                                         .collect::<std::result::Result<Vec<_>, _>>()
                                     {
-                                        for uid2 in uids {
-                                            if uid1 == uid2 {
-                                                return Residual::Concrete {
-                                                    value: true.into(),
-                                                    ty,
-                                                };
-                                            } else if let Some(entity) = self.entities.get(uid1) {
-                                                if let Some(ancestors) = &entity.ancestors {
+                                        // TODO: could optimize here by checking the size of the set; if it is zero
+                                        // this is always false, no matter what the LHS is.
+                                        if uids.is_empty() {
+                                            return Residual::Concrete {
+                                                value: false.into(),
+                                                ty,
+                                            };
+                                        }
+                                        // The expression is FooType::"abc" in [FooType::"def", FooType::"ghi", ...]
+                                        // Case 1: the LHS exists within the set
+                                        if uids.iter().any(|uid2| uid1 == *uid2) {
+                                            return Residual::Concrete {
+                                                value: true.into(),
+                                                ty,
+                                            };
+                                        }
+                                        // Case 2: need to lookup the LHS' ancestors to know if there is overlap
+                                        match self.entities.get(uid1).and_then(|f| f.ancestors.as_ref()) {
+                                            None => residual(arg1, arg2, ty),
+                                            Some(ancestors) => {
+                                                for uid2 in uids {
                                                     if ancestors.contains(uid2) {
                                                         return Residual::Concrete {
                                                             value: true.into(),
                                                             ty,
                                                         };
                                                     }
-                                                } else {
-                                                    return residual(arg1, arg2, ty);
                                                 }
-                                            } else {
-                                                return residual(arg1, arg2, ty);
+                                                Residual::Concrete {
+                                                    value: false.into(),
+                                                    ty,
+                                                }
                                             }
                                         }
-                                        Residual::Concrete {
-                                            value: false.into(),
-                                            ty,
-                                        }
                                     } else {
+                                        // set is not a list of concrete entity UIDs
+                                        // TODO: check if validation allows principal in [true, false]
                                         Residual::Error(ty)
                                     }
                                 } else {
+                                    // RHS is not an entity UID or set of entity UIDs, validation should disallow this
                                     Residual::Error(ty)
                                 }
                             } else {
+                                // LHS is not an entity UID, validation should disallow this
                                 Residual::Error(ty)
                             }
                         }
@@ -390,6 +477,7 @@ impl Evaluator<'_> {
                                                     ty,
                                                 }
                                             } else {
+                                                // the RHS tag does not exist on the entity, validation should disallow this
                                                 Residual::Error(ty)
                                             }
                                         } else {
@@ -399,9 +487,11 @@ impl Evaluator<'_> {
                                         residual(arg1, arg2, ty)
                                     }
                                 } else {
+                                    // RHS is not a string, validation should disallow this
                                     Residual::Error(ty)
                                 }
                             } else {
+                                // LHS is not an entity UID, validation should disallow this
                                 Residual::Error(ty)
                             }
                         }
@@ -421,9 +511,11 @@ impl Evaluator<'_> {
                                         residual(arg1, arg2, ty)
                                     }
                                 } else {
+                                    // RHS is not a string, validation should disallow this
                                     Residual::Error(ty)
                                 }
                             } else {
+                                // LHS is not an entity UID, validation should disallow this
                                 Residual::Error(ty)
                             }
                         }
@@ -432,6 +524,7 @@ impl Evaluator<'_> {
                                 value: s.contains(v2).into(),
                                 ty,
                             },
+                            // LHS is not a set, validation should disallow this
                             _ => Residual::Error(ty),
                         },
                         BinaryOp::ContainsAll => match (v1.get_as_set(), v2.get_as_set()) {
@@ -439,6 +532,7 @@ impl Evaluator<'_> {
                                 value: arg2_set.is_subset(arg1_set).into(),
                                 ty,
                             },
+                            // LHS or RHS are not sets, validation should disallow this
                             _ => Residual::Error(ty),
                         },
                         BinaryOp::ContainsAny => match (v1.get_as_set(), v2.get_as_set()) {
@@ -446,11 +540,20 @@ impl Evaluator<'_> {
                                 value: (!arg1_set.is_disjoint(arg2_set)).into(),
                                 ty,
                             },
+                            // LHS or RHS are not sets, validation should disallow this
                             _ => Residual::Error(ty),
                         },
                     },
+                    // propagate errors upwards
                     (Residual::Error(_), _) => Residual::Error(ty),
                     (_, Residual::Error(_)) => Residual::Error(ty),
+                    // TODO: is there something that can be done when one side is concrete and the other is a residual?
+                    // The only thing I can think of is "1 == <string residual>", but the validator should probably
+                    // have cast this to a False singleton earlier; but we probably need to start making use of it, and/or the type info in the residual.
+                    // Also could most likely reduce "<unknown> in []" => false, and "[].contains(<unknown>) => false"
+                    // I think <unknown>.containsAll([]) => true, but that [].containsAll(<unknown>) cannot be simplified,
+                    // as if the unknown contains zero values, we get true, otherwise false.
+                    // Also, <unknown>.containsAny([]) => false, and [].containsAny(<unknown>) => false.
                     (_, _) => residual(arg1, arg2, ty),
                 }
             }
@@ -471,6 +574,7 @@ impl Evaluator<'_> {
                             return Residual::Concrete { value, ty };
                         }
                     }
+                    // TODO: actually return the error from the extension function instead.
                     Residual::Error(ty)
                 } else if args.iter().any(|r| matches!(r, Residual::Error(_))) {
                     Residual::Error(ty)
@@ -485,8 +589,8 @@ impl Evaluator<'_> {
                 }
             }
             ResidualKind::GetAttr { expr, attr } => {
-                let r = self.interpret(expr);
-                match &r {
+                let expr = self.interpret(expr);
+                match &expr {
                     Residual::Concrete {
                         value:
                             Value {
@@ -501,6 +605,7 @@ impl Evaluator<'_> {
                                 ty,
                             }
                         } else {
+                            // attribute does not exist, this is covered by validation
                             Residual::Error(ty)
                         }
                     }
@@ -520,32 +625,35 @@ impl Evaluator<'_> {
                                         ty,
                                     };
                                 } else {
+                                    // attribute does not exist, this is covered by validation
                                     return Residual::Error(ty);
                                 }
                             }
                         }
                         Residual::Partial {
                             kind: ResidualKind::GetAttr {
-                                expr: Arc::new(r),
+                                expr: Arc::new(expr),
                                 attr: attr.clone(),
                             },
                             ty,
                         }
                     }
+                    // the LHS must be an Entity UID or anonymous record
                     Residual::Concrete { .. } => Residual::Error(ty),
                     Residual::Partial { .. } => Residual::Partial {
                         kind: ResidualKind::GetAttr {
-                            expr: Arc::new(r),
+                            expr: Arc::new(expr),
                             attr: attr.clone(),
                         },
                         ty,
                     },
+                    // propagate errors upwards
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
             ResidualKind::HasAttr { expr, attr } => {
-                let r = self.interpret(expr);
-                match &r {
+                let expr = self.interpret(expr);
+                match &expr {
                     Residual::Concrete {
                         value:
                             Value {
@@ -575,20 +683,22 @@ impl Evaluator<'_> {
                         }
                         Residual::Partial {
                             kind: ResidualKind::HasAttr {
-                                expr: Arc::new(r),
+                                expr: Arc::new(expr),
                                 attr: attr.clone(),
                             },
                             ty,
                         }
                     }
+                    // the LHS must be an Entity UID or anonymous record
                     Residual::Concrete { .. } => Residual::Error(ty),
                     Residual::Partial { .. } => Residual::Partial {
                         kind: ResidualKind::HasAttr {
-                            expr: Arc::new(r),
+                            expr: Arc::new(expr),
                             attr: attr.clone(),
                         },
                         ty,
                     },
+                    // propagate errors upwards
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -599,6 +709,7 @@ impl Evaluator<'_> {
                         if let Ok(v) = crate::evaluator::unary_app(*op, value.clone(), None) {
                             Residual::Concrete { value: v, ty }
                         } else {
+                            // Note! Negation can result in a non-validated error
                             Residual::Error(ty)
                         }
                     }
@@ -609,6 +720,7 @@ impl Evaluator<'_> {
                         },
                         ty,
                     },
+                    // propagate errors upwards
                     Residual::Error(_) => Residual::Error(ty),
                 }
             }
@@ -627,6 +739,7 @@ impl Evaluator<'_> {
                         ty,
                     }
                 } else if rs.iter().any(|r| matches!(r, Residual::Error(_))) {
+                    // propagate errors upwards
                     Residual::Error(ty)
                 } else {
                     Residual::Partial {
@@ -656,6 +769,7 @@ impl Evaluator<'_> {
                     let mut m = BTreeMap::new();
                     for (a, r) in record {
                         if matches!(r, Residual::Error(_)) {
+                            // propagate errors upwards
                             return Residual::Error(ty);
                         } else {
                             m.insert(a, r);
