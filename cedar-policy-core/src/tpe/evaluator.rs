@@ -97,57 +97,44 @@ impl Evaluator<'_> {
             ResidualKind::And { left, right } => {
                 let left = self.interpret(left);
                 match &left {
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::Bool(false)),
-                                ..
-                            },
-                        ..
-                    } => mk_concrete(false.into()),
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::Bool(true)),
-                                ..
-                            },
-                        ..
-                    } => self.interpret(right),
-                    Residual::Concrete { .. } => mk_error(),
+                    Residual::Concrete { value, .. } => match value.get_as_bool() {
+                        Ok(false) => mk_concrete(false.into()), // false && <right> => false
+                        Ok(true) => self.interpret(right),      // true && <right> => <right>
+                        Err(_) => mk_error(),                   // <error> && <right> => <error>
+                    },
                     Residual::Partial { .. } => {
                         let right = self.interpret(right);
                         match &right {
-                            Residual::Concrete {
-                                value:
-                                    Value {
-                                        value: ValueKind::Lit(ast::Literal::Bool(true)),
-                                        ..
-                                    },
-                                ..
-                            } => left,
-                            Residual::Concrete {
-                                value:
-                                    Value {
-                                        value: ValueKind::Lit(ast::Literal::Bool(false)),
-                                        ..
-                                    },
-                                ..
-                            } => {
-                                if !left.can_error_assuming_well_formed() {
-                                    // simplify <error-free> && false == false
-                                    mk_concrete(false.into())
-                                } else {
-                                    // cannot simplify <non-error-free> && false
-                                    mk_residual(ResidualKind::And {
-                                        left: Arc::new(left),
-                                        right: Arc::new(mk_concrete(false.into())),
-                                    })
+                            Residual::Concrete { value, .. } => match value.get_as_bool() {
+                                // <left-residual> && true => <left-residual>
+                                Ok(true) => left,
+                                Ok(false) => {
+                                    if !left.can_error_assuming_well_formed() {
+                                        // simplify <error-free> && false == false
+                                        mk_concrete(false.into())
+                                    } else {
+                                        // cannot simplify <non-error-free> && false
+                                        mk_residual(ResidualKind::And {
+                                            left: Arc::new(left),
+                                            right: Arc::new(mk_concrete(false.into())),
+                                        })
+                                    }
                                 }
+                                // "<left-residual> && <nonbool>" => "<left-residual> && <error>"
+                                // TODO(luxas): Introduce a Residual::PartialError variant that says "the expression definitely errors, but with an unknown error"
+                                Err(_) => mk_residual(ResidualKind::And {
+                                    left: Arc::new(left),
+                                    right: Arc::new(mk_error()),
+                                }),
+                            },
+                            // Cannot simplify "<left-residual> && <right-residual>" or "<left-residual> && <error>"
+                            // The latter expression could become a Residual::PartialError later.
+                            Residual::Partial { .. } | Residual::Error(_) => {
+                                mk_residual(ResidualKind::And {
+                                    left: Arc::new(left),
+                                    right: Arc::new(right),
+                                })
                             }
-                            _ => mk_residual(ResidualKind::And {
-                                left: Arc::new(left),
-                                right: Arc::new(right),
-                            }),
                         }
                     }
                     Residual::Error(_) => mk_error(),
@@ -156,57 +143,44 @@ impl Evaluator<'_> {
             ResidualKind::Or { left, right } => {
                 let left = self.interpret(left);
                 match &left {
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::Bool(true)),
-                                ..
-                            },
-                        ..
-                    } => mk_concrete(true.into()),
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::Bool(false)),
-                                ..
-                            },
-                        ..
-                    } => self.interpret(right),
-                    Residual::Concrete { .. } => mk_error(),
+                    Residual::Concrete { value, .. } => match value.get_as_bool() {
+                        Ok(true) => mk_concrete(true.into()), // true || <right> => true
+                        Ok(false) => self.interpret(right),   // false || <right> => <right>
+                        Err(_) => mk_error(),                 // <error> || <right> => <error>
+                    },
                     Residual::Partial { .. } => {
                         let right = self.interpret(right);
                         match &right {
-                            Residual::Concrete {
-                                value:
-                                    Value {
-                                        value: ValueKind::Lit(ast::Literal::Bool(false)),
-                                        ..
-                                    },
-                                ..
-                            } => left,
-                            Residual::Concrete {
-                                value:
-                                    Value {
-                                        value: ValueKind::Lit(ast::Literal::Bool(true)),
-                                        ..
-                                    },
-                                ..
-                            } => {
-                                if !left.can_error_assuming_well_formed() {
-                                    // simplify <error-free> || true == true
-                                    mk_concrete(true.into())
-                                } else {
-                                    // cannot simplify <non-error-free> || true
-                                    mk_residual(ResidualKind::Or {
-                                        left: Arc::new(left),
-                                        right: Arc::new(mk_concrete(true.into())),
-                                    })
+                            Residual::Concrete { value, .. } => match value.get_as_bool() {
+                                // <left-residual> || false == <left-residual>
+                                Ok(false) => left,
+                                Ok(true) => {
+                                    if !left.can_error_assuming_well_formed() {
+                                        // simplify <error-free> || true == true
+                                        mk_concrete(true.into())
+                                    } else {
+                                        // cannot simplify <non-error-free> || true
+                                        mk_residual(ResidualKind::Or {
+                                            left: Arc::new(left),
+                                            right: Arc::new(mk_concrete(true.into())),
+                                        })
+                                    }
                                 }
+                                // "<left-residual> || <nonbool>" => "<left-residual> || <error>"
+                                // Note that this is not necessarily a Residual::PartialError, as "<left-residual>" might evaluate to true,
+                                // in which case the whole expression is true, regardless of the RHS error.
+                                Err(_) => mk_residual(ResidualKind::Or {
+                                    left: Arc::new(left),
+                                    right: Arc::new(mk_error()),
+                                }),
+                            },
+                            // Cannot simplify "<left-residual> || <right-residual>" or "<left-residual> || <error>"
+                            Residual::Partial { .. } | Residual::Error(_) => {
+                                mk_residual(ResidualKind::Or {
+                                    left: Arc::new(left),
+                                    right: Arc::new(right),
+                                })
                             }
-                            _ => mk_residual(ResidualKind::Or {
-                                left: Arc::new(left),
-                                right: Arc::new(right),
-                            }),
                         }
                     }
                     Residual::Error(_) => mk_error(),
@@ -219,21 +193,11 @@ impl Evaluator<'_> {
             } => {
                 let test_expr = self.interpret(test_expr);
                 match &test_expr {
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::Bool(b)),
-                                ..
-                            },
-                        ..
-                    } => {
-                        if *b {
-                            self.interpret(then_expr)
-                        } else {
-                            self.interpret(else_expr)
-                        }
-                    }
-                    Residual::Concrete { .. } => mk_error(),
+                    Residual::Concrete { value, .. } => match value.get_as_bool() {
+                        Ok(true) => self.interpret(then_expr), // (if true then <then> else <else>) => <then>
+                        Ok(false) => self.interpret(else_expr), // (if false then <then> else <else>) => <else>
+                        Err(_) => mk_error(), // (if <error> then <then> else <else>) => <error>
+                    },
                     Residual::Partial { .. } => mk_residual(ResidualKind::If {
                         test_expr: Arc::new(test_expr),
                         then_expr: Arc::new(self.interpret(then_expr)),
@@ -245,15 +209,10 @@ impl Evaluator<'_> {
             ResidualKind::Is { expr, entity_type } => {
                 let expr = self.interpret(expr);
                 match &expr {
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::EntityUID(uid)),
-                                ..
-                            },
-                        ..
-                    } => mk_concrete((uid.entity_type() == entity_type).into()),
-                    Residual::Concrete { .. } => mk_error(),
+                    Residual::Concrete { value, .. } => match value.get_as_entity() {
+                        Ok(uid) => mk_concrete((uid.entity_type() == entity_type).into()),
+                        Err(_) => mk_error(), // <error> is <entity_type> => <error>
+                    },
                     Residual::Partial {
                         kind: ResidualKind::Var(Var::Principal),
                         ..
@@ -272,15 +231,10 @@ impl Evaluator<'_> {
             ResidualKind::Like { expr, pattern } => {
                 let expr = self.interpret(expr);
                 match &expr {
-                    Residual::Concrete {
-                        value:
-                            Value {
-                                value: ValueKind::Lit(ast::Literal::String(s)),
-                                ..
-                            },
-                        ..
-                    } => mk_concrete(pattern.wildcard_match(s).into()),
-                    Residual::Concrete { .. } => mk_error(),
+                    Residual::Concrete { value, .. } => match value.get_as_string() {
+                        Ok(s) => mk_concrete(pattern.wildcard_match(s).into()),
+                        Err(_) => mk_error(), // <error> like <pattern> => <error>
+                    },
                     Residual::Partial { .. } => mk_residual(ResidualKind::Like {
                         expr: Arc::new(expr),
                         pattern: pattern.clone(),
@@ -642,6 +596,7 @@ mod tests {
         FromNormalizedStr,
     };
     use cool_asserts::assert_matches;
+    use insta::assert_debug_snapshot;
     use itertools::Itertools;
 
     use crate::{
@@ -755,9 +710,19 @@ mod tests {
             entities: &PartialEntities::new(),
             extensions: Extensions::all_available(),
         };
+
+        // Note: The test expressions are in the same order as the match statements
+        // Also note that some of these expression are not valid inputs.
+        // The evaluator does not perform any validation.
+
+        // "false && <any>" => "false"
         assert_matches!(
             eval.interpret_expr(&builder().and(
-                builder().noteq(builder().var(Var::Resource), builder().var(Var::Resource)),
+                builder().not(builder().binary_app(
+                    BinaryOp::Eq,
+                    builder().var(Var::Resource),
+                    builder().var(Var::Resource)
+                )),
                 builder().val(42)
             ))
             .unwrap(),
@@ -769,30 +734,7 @@ mod tests {
                 ..
             }
         );
-        // Note that this expression is not an invalid input
-        // The evaluator does not perform any validation
-        assert_matches!(
-            eval.interpret_expr(&builder().and(builder().var(Var::Principal), builder().val(true)))
-                .unwrap(),
-            Residual::Partial {
-                kind: ResidualKind::Var(Var::Principal),
-                ..
-            }
-        );
-        assert_matches!(
-            eval.interpret_expr(&builder().and(
-                builder().noteq(
-                    builder().mul(builder().val(i64::MAX), builder().val(2)),
-                    builder().val(0)
-                ),
-                builder().val(42)
-            ))
-            .unwrap(),
-            Residual::Error(_),
-        );
-        // resource == resource && 42 => 42
-        // Note that this expression is not an invalid input
-        // The evaluator does not perform any validation
+        // "true && <any>" => "<any>"
         assert_matches!(
             eval.interpret_expr(&builder().and(
                 builder().binary_app(
@@ -811,14 +753,36 @@ mod tests {
                 ..
             }
         );
-        // <error-free> && false => false
-        // principal in Organization::"foo" && 41 == 42 => false
+
+        // "<error> && <residual>" => "<error>"
         assert_matches!(
             eval.interpret_expr(&builder().and(
-                builder().is_in(
-                    builder().var(Var::Principal),
-                    builder().val(EntityUID::with_eid_and_type("Organization", "foo").unwrap())
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
                 ),
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+            ))
+            .unwrap(),
+            Residual::Error(_),
+        );
+        // "<residual> && true" => "<residual>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().and(builder().var(Var::Principal), builder().val(true)))
+                .unwrap(),
+            @"
+        Partial {
+            kind: Var(
+                Principal,
+            ),
+            ty: Never,
+        }
+        "
+        );
+        // "<error-free> && false" => "false"
+        assert_matches!(
+            eval.interpret_expr(&builder().and(
+                builder().has_attr(builder().var(Var::Principal), "foo".into()),
                 builder().is_eq(builder().val(41), builder().val(42))
             ))
             .unwrap(),
@@ -830,9 +794,9 @@ mod tests {
                 ..
             },
         );
-        // <non-error-free> && false cannot be simplified, e.g.
-        // principal.foo + 1 == 100 && 41 == 42
-        assert_matches!(
+        // "<non-error-free> && false" cannot be fully simplified, e.g.
+        // "principal.foo + 1 == 100 && 41 == 42" => "principal.foo + 1 == 100 && false"
+        assert_debug_snapshot!(
             eval.interpret_expr(&builder().and(
                 builder().is_eq(
                     builder().add(
@@ -844,13 +808,187 @@ mod tests {
                 builder().is_eq(builder().val(41), builder().val(42))
             ))
             .unwrap(),
-            // cannot match against the full residual, because of the Arc in the And enum variant,
-            // and due to Residual not implementing the Eq trait, but this shows that the evaluator
-            // kept the residual partial and with an And clause.
-            Residual::Partial {
-                kind: ResidualKind::And { .. },
-                ..
-            }
+            @r#"
+        Partial {
+            kind: And {
+                left: Partial {
+                    kind: BinaryApp {
+                        op: Eq,
+                        arg1: Partial {
+                            kind: BinaryApp {
+                                op: Add,
+                                arg1: Partial {
+                                    kind: GetAttr {
+                                        expr: Partial {
+                                            kind: Var(
+                                                Principal,
+                                            ),
+                                            ty: Never,
+                                        },
+                                        attr: "foo",
+                                    },
+                                    ty: Never,
+                                },
+                                arg2: Concrete {
+                                    value: Value {
+                                        value: Lit(
+                                            Long(
+                                                1,
+                                            ),
+                                        ),
+                                        loc: None,
+                                    },
+                                    ty: Never,
+                                },
+                            },
+                            ty: Never,
+                        },
+                        arg2: Concrete {
+                            value: Value {
+                                value: Lit(
+                                    Long(
+                                        100,
+                                    ),
+                                ),
+                                loc: None,
+                            },
+                            ty: Never,
+                        },
+                    },
+                    ty: Never,
+                },
+                right: Concrete {
+                    value: Value {
+                        value: Lit(
+                            Bool(
+                                false,
+                            ),
+                        ),
+                        loc: None,
+                    },
+                    ty: Never,
+                },
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<residual> && <nonbool>" => "<residual> && <error>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().and(
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+                builder().val(42),
+            ))
+            .unwrap(),
+            @r#"
+        Partial {
+            kind: And {
+                left: Partial {
+                    kind: GetAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Error(
+                    Never,
+                ),
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // The "<residual> && <residual>" case cannot be simplified, e.g.
+        // "principal.foo && principal.bar" => "principal.foo && principal.bar"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().and(
+                builder().has_attr(builder().var(Var::Principal), "foo".into()),
+                builder().has_attr(builder().var(Var::Principal), "bar".into()))).unwrap(),
+            @r#"
+        Partial {
+            kind: And {
+                left: Partial {
+                    kind: HasAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Partial {
+                    kind: HasAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "bar",
+                    },
+                    ty: Never,
+                },
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<residual> && <error>" cannot be simplified
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().and(
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
+                ),
+            ))
+            .unwrap(),
+            @r#"
+        Partial {
+            kind: And {
+                left: Partial {
+                    kind: GetAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Error(
+                    Never,
+                ),
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<error> && <any>" => "<error>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().and(
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
+                ),
+                builder().val(false),
+            ))
+            .unwrap(),
+            @"
+        Error(
+            Never,
+        )
+        "
         );
     }
 
@@ -870,6 +1008,11 @@ mod tests {
             entities: &PartialEntities::new(),
             extensions: Extensions::all_available(),
         };
+        // Note: The test expressions are in the same order as the match statements
+        // Also note that some of these expression are not valid inputs.
+        // The evaluator does not perform any validation.
+
+        // "true || <any>" => "true"
         assert_matches!(
             eval.interpret_expr(&builder().or(
                 builder().binary_app(
@@ -888,33 +1031,14 @@ mod tests {
                 ..
             }
         );
-        // Note that this expression is not an invalid input
-        // The evaluator does not perform any validation
-        assert_matches!(
-            eval.interpret_expr(&builder().or(builder().var(Var::Principal), builder().val(false)))
-                .unwrap(),
-            Residual::Partial {
-                kind: ResidualKind::Var(Var::Principal),
-                ..
-            }
-        );
+        // "false || <any>" => "<any>"
         assert_matches!(
             eval.interpret_expr(&builder().or(
-                builder().noteq(
-                    builder().mul(builder().val(i64::MAX), builder().val(2)),
-                    builder().val(0)
-                ),
-                builder().val(42)
-            ))
-            .unwrap(),
-            Residual::Error(_),
-        );
-        // resource != resource || 42 => 42
-        // Note that this expression is not an invalid input
-        // The evaluator does not perform any validation
-        assert_matches!(
-            eval.interpret_expr(&builder().or(
-                builder().noteq(builder().var(Var::Resource), builder().var(Var::Resource)),
+                builder().not(builder().binary_app(
+                    BinaryOp::Eq,
+                    builder().var(Var::Resource),
+                    builder().var(Var::Resource)
+                )),
                 builder().val(42)
             ))
             .unwrap(),
@@ -926,8 +1050,32 @@ mod tests {
                 ..
             }
         );
-        // <error-free> || true => true
-        // principal || 42 == 42 => true
+        // "<error> || <residual>" => "<error>"
+        assert_matches!(
+            eval.interpret_expr(&builder().or(
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
+                ),
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+            ))
+            .unwrap(),
+            Residual::Error(_),
+        );
+        // "<residual> || false" => "<residual>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().or(builder().var(Var::Principal), builder().val(false)))
+                .unwrap(),
+            @"
+        Partial {
+            kind: Var(
+                Principal,
+            ),
+            ty: Never,
+        }
+        "
+        );
+        // "<error-free> || true" => "true"
         assert_matches!(
             eval.interpret_expr(&builder().or(
                 builder().has_attr(builder().var(Var::Principal), "foo".into()),
@@ -942,9 +1090,9 @@ mod tests {
                 ..
             },
         );
-        // <non-error-free> || true cannot be simplified, e.g.
-        // principal.foo + 1 == 100 || 42 == 42
-        assert_matches!(
+        // "<non-error-free> || true" cannot be fully simplified, e.g.
+        // "principal.foo + 1 == 100 || 42 == 42" => "principal.foo + 1 == 100 || true"
+        assert_debug_snapshot!(
             eval.interpret_expr(&builder().or(
                 builder().is_eq(
                     builder().add(
@@ -956,13 +1104,187 @@ mod tests {
                 builder().is_eq(builder().val(42), builder().val(42))
             ))
             .unwrap(),
-            // cannot match against the full residual, because of the Arc in the Or enum variant,
-            // and due to Residual not implementing the Eq trait, but this shows that the evaluator
-            // kept the residual partial and with an Or clause.
-            Residual::Partial {
-                kind: ResidualKind::Or { .. },
-                ..
-            }
+            @r#"
+        Partial {
+            kind: Or {
+                left: Partial {
+                    kind: BinaryApp {
+                        op: Eq,
+                        arg1: Partial {
+                            kind: BinaryApp {
+                                op: Add,
+                                arg1: Partial {
+                                    kind: GetAttr {
+                                        expr: Partial {
+                                            kind: Var(
+                                                Principal,
+                                            ),
+                                            ty: Never,
+                                        },
+                                        attr: "foo",
+                                    },
+                                    ty: Never,
+                                },
+                                arg2: Concrete {
+                                    value: Value {
+                                        value: Lit(
+                                            Long(
+                                                1,
+                                            ),
+                                        ),
+                                        loc: None,
+                                    },
+                                    ty: Never,
+                                },
+                            },
+                            ty: Never,
+                        },
+                        arg2: Concrete {
+                            value: Value {
+                                value: Lit(
+                                    Long(
+                                        100,
+                                    ),
+                                ),
+                                loc: None,
+                            },
+                            ty: Never,
+                        },
+                    },
+                    ty: Never,
+                },
+                right: Concrete {
+                    value: Value {
+                        value: Lit(
+                            Bool(
+                                true,
+                            ),
+                        ),
+                        loc: None,
+                    },
+                    ty: Never,
+                },
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<residual> || <nonbool>" => "<residual> || <error>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().or(
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+                builder().val(42),
+            ))
+            .unwrap(),
+            @r#"
+        Partial {
+            kind: Or {
+                left: Partial {
+                    kind: GetAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Error(
+                    Never,
+                ),
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // The "<residual> || <residual>" case cannot be simplified, e.g.
+        // "principal.foo || principal.bar" => "principal.foo || principal.bar"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().or(
+                builder().has_attr(builder().var(Var::Principal), "foo".into()),
+                builder().has_attr(builder().var(Var::Principal), "bar".into()))).unwrap(),
+            @r#"
+        Partial {
+            kind: Or {
+                left: Partial {
+                    kind: HasAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Partial {
+                    kind: HasAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "bar",
+                    },
+                    ty: Never,
+                },
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<residual> || <error>" cannot be simplified
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().or(
+                builder().get_attr(builder().var(Var::Principal), "foo".into()),
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
+                ),
+            ))
+            .unwrap(),
+            @r#"
+        Partial {
+            kind: Or {
+                left: Partial {
+                    kind: GetAttr {
+                        expr: Partial {
+                            kind: Var(
+                                Principal,
+                            ),
+                            ty: Never,
+                        },
+                        attr: "foo",
+                    },
+                    ty: Never,
+                },
+                right: Error(
+                    Never,
+                ),
+            },
+            ty: Never,
+        }
+        "#
+        );
+        // "<error> || <any>" => "<error>"
+        assert_debug_snapshot!(
+            eval.interpret_expr(&builder().or(
+                builder().noteq(
+                    builder().mul(builder().val(i64::MAX), builder().val(2)),
+                    builder().val(0)
+                ),
+                builder().val(true),
+            ))
+            .unwrap(),
+            @"
+        Error(
+            Never,
+        )
+        "
         );
     }
 
