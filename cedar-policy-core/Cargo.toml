@@ -65,6 +65,7 @@ experimental = [
     "partial-validate",
     "partial-eval",
     "variadic-is-in-range",
+    "anyall",
 ]
 tpe = []
 variadic-is-in-range = []

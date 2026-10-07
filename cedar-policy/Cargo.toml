@@ -61,6 +61,7 @@ experimental = [
     "deprecated-schema-compat",
     "tpe",
     "variadic-is-in-range",
+    "anyall",
 ]
 entity-manifest = ["cedar-policy-core/entity-manifest"]
 partial-eval = ["cedar-policy-core/partial-eval"]
