@@ -80,6 +80,10 @@ deprecated-schema-compat = []
 tpe = ["cedar-policy-core/tpe"]
 variadic-is-in-range = ["cedar-policy-core/variadic-is-in-range"]
 
+# Non-nested `.any`/`.all` set operators (spec: anyall-set-operators). Passthrough
+# to cedar-policy-core; inert until later phases. Off by default.
+anyall = ["cedar-policy-core/anyall"]
+
 [dev-dependencies]
 miette = { version = "7.6.0", features = ["fancy"] }
 cool_asserts = "2.0"

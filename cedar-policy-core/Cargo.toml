@@ -69,6 +69,10 @@ experimental = [
 tpe = []
 variadic-is-in-range = []
 
+# Non-nested `.any`/`.all` set operators (spec: anyall-set-operators). Inert until
+# the AST/eval/validator arms land in later phases; off by default.
+anyall = []
+
 # Unstable tooling features
 unstable-tooling = ["tolerant-ast", "extended-schema"]
 tolerant-ast = []
