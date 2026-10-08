@@ -451,10 +451,9 @@ impl<T> PredExpr<T> {
                 .iter()
                 .cmp(attrs1.iter())
                 .then_with(|| expr.cmp_shape(expr1)),
-            (Like { expr, pattern }, Like { expr: expr1, pattern: pattern1 }) => pattern
-                .to_string()
-                .cmp(&pattern1.to_string())
-                .then_with(|| expr.cmp_shape(expr1)),
+            (Like { expr, pattern }, Like { expr: expr1, pattern: pattern1 }) => {
+                pattern.cmp(pattern1).then_with(|| expr.cmp_shape(expr1))
+            }
             (
                 Is { expr, entity_type },
                 Is {

@@ -41,6 +41,9 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprWithErrsBuilder<T> {
     type BuildError = Infallible;
     type Data = T;
 
+    #[cfg(feature = "anyall")]
+    type Pred = PredExpr<T>;
+
     #[cfg(feature = "tolerant-ast")]
     type ErrorType = Infallible;
 
@@ -50,6 +53,22 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprWithErrsBuilder<T> {
 
     fn data(&self) -> &Self::Data {
         &self.data
+    }
+
+    #[cfg(feature = "anyall")]
+    fn all(self, expr: Expr<T>, pred: PredExpr<T>) -> Expr<T> {
+        self.with_expr_kind(ExprKind::All {
+            expr: Arc::new(expr),
+            pred: Arc::new(pred),
+        })
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_ast<U>(&self, pred: &PredExpr<U>) -> PredExpr<T>
+    where
+        U: Clone,
+    {
+        pred.with_default_data()
     }
 
     fn with_data(data: T) -> Self {

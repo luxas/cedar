@@ -529,6 +529,10 @@ impl From<&ast::Expr> for models::Expr {
                     .collect();
                 models::expr::ExprKind::Record(models::expr::Record { items: precord })
             },
+            #[cfg(feature = "anyall")]
+            ast::ExprKind::All { .. } => unimplemented!(
+                "Protobuf serialization of `.all`/`.any` set operators is not yet supported (deferred past Phase 1)"
+            ),
             #[cfg(feature="tolerant-ast")]
             ast::ExprKind::Error { .. } => unimplemented!("Protobufs feature not compatible with ASTs that contain error nodes - this should never happen"),
         };
