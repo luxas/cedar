@@ -20,6 +20,10 @@ mod expr;
 #[cfg(feature = "tolerant-ast")]
 pub(crate) mod expr_allows_errors;
 pub use expr::*;
+#[cfg(feature = "anyall")]
+mod pred;
+#[cfg(feature = "anyall")]
+pub use pred::*;
 mod entity;
 pub use entity::*;
 mod extension;
