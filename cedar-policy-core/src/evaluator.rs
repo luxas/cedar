@@ -814,7 +814,10 @@ impl<'e> Evaluator<'e> {
                         }
                         if residual {
                             // Conservative: keep the whole node symbolic, since
-                            // a residual element could still error later.
+                            // a residual element could still error later. The
+                            // receiver is rebuilt from its value so it is not
+                            // re-evaluated; per-element residualization is the
+                            // TPE work of Phase 6.5.
                             Ok(PartialValue::Residual(Expr::all(
                                 Expr::from(v.clone()),
                                 pred.as_ref().clone(),

@@ -338,7 +338,9 @@ struct SingleEnvTypechecker<'a> {
 }
 
 /// Name of the unknown that stands for `it` when a set-quantifier predicate is
-/// instantiated for typechecking. It cannot be written in policy text.
+/// instantiated for typechecking. It cannot be written in policy text, and
+/// `PredExprKind` has no `Unknown` variant, so this name is only ever produced
+/// by `PredExpr::instantiate_with`. Revisit if `PredExpr` gains an unknown leaf.
 #[cfg(feature = "anyall")]
 pub(crate) const IT_PLACEHOLDER: &str = "__cedar::anyall::it";
 
