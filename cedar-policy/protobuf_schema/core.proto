@@ -173,6 +173,11 @@ message Expr {
         Set set = 14;
         Record record = 15;
         ExtHasAttr extHasAttr = 16;
+        // `.all`/`.any` set quantifier (`anyall` feature); `any` is encoded as
+        // `!all(!pred)`
+        All all = 17;
+        // the element keyword `it`, valid only inside `All.pred`
+        Item item = 18;
     }
 
     message Literal {
@@ -258,6 +263,13 @@ message Expr {
         Expr expr = 1;
         repeated string attrs = 2;
     }
+
+    message All {
+        Expr arg = 1;
+        Expr pred = 2;
+    }
+
+    message Item {}
 
     message Like {
         Expr expr = 1;
