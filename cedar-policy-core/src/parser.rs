@@ -195,7 +195,10 @@ pub fn parse_policy_or_template_to_est(text: &str) -> Result<est::Policy, err::P
 /// or its constructors
 pub(crate) fn parse_expr(ptext: &str) -> Result<ast::Expr, err::ParseErrors> {
     let cst = text_to_cst::parse_expr(ptext)?;
-    cst.to_expr::<ast::ExprBuilder<()>>()
+    let e = cst.to_expr::<ast::ExprBuilder<()>>()?;
+    #[cfg(feature = "anyall")]
+    cst_to_ast::reject_stray_it(&e)?;
+    Ok(e)
 }
 
 /// parse a RestrictedExpr

@@ -290,6 +290,8 @@ impl Node<Option<cst::Policy>> {
         // convert conditions
         let maybe_conds = ParseErrors::transpose(policy.conds.iter().map(|c| {
             let (e, is_when) = c.to_expr::<ast::ExprBuilder<()>>()?;
+            #[cfg(feature = "anyall")]
+            reject_stray_it(&e)?;
 
             let slot_errs = e.slots().map(|slot| {
                 ToASTError::new(
@@ -388,6 +390,8 @@ impl Node<Option<cst::Policy>> {
         // convert conditions
         let maybe_conds = ParseErrors::transpose(policy.conds.iter().map(|c| {
             let (e, is_when) = c.to_expr::<ExprWithErrsBuilder<()>>()?;
+            #[cfg(feature = "anyall")]
+            reject_stray_it(&e)?;
             let slot_errs = e.slots().map(|slot| {
                 ToASTError::new(
                     ToASTErrorKind::slots_in_condition_clause(
@@ -735,6 +739,27 @@ impl Node<Option<cst::Ident>> {
     }
 }
 
+/// Is `name` the bare keyword `it` (the element of a `.all`/`.any` predicate)?
+#[cfg(feature = "anyall")]
+fn is_it_keyword(name: &ast::Name) -> bool {
+    name.is_unqualified() && AsRef::<str>::as_ref(&name.basename()) == "it"
+}
+
+/// Reject a use of the keyword `it` outside any `.all`/`.any` predicate
+/// (requirement 1.6). Inside a predicate `it` has become a `PredExpr` item, so
+/// any remaining stand-in for `it` is outside one.
+#[cfg(feature = "anyall")]
+pub(crate) fn reject_stray_it<T>(e: &ast::Expr<T>) -> Result<()> {
+    match e.subexpressions().find(|s| ast::is_it_sentinel(s)) {
+        Some(stray) => Err(ToASTError::new(
+            ToASTErrorKind::ItOutsidePredicate,
+            stray.source_loc().cloned(),
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
 impl ast::UnreservedId {
     fn to_meth<Build: ExprBuilderInfallibleBuild>(
         &self,
@@ -758,6 +783,25 @@ impl ast::UnreservedId {
                 .map(|arg| builder.get_tag(e, arg)),
             "hasTag" => extract_single_argument(args.into_iter(), "hasTag", loc)
                 .map(|arg| builder.has_tag(e, arg)),
+            #[cfg(feature = "anyall")]
+            "all" => {
+                let arg = extract_single_argument(args.into_iter(), "all", loc)?;
+                let pred = builder.pred_from_expr(arg).map_err(|err| {
+                    ToASTError::new(ToASTErrorKind::InvalidQuantifierPredicate(err), loc.cloned())
+                })?;
+                Ok(builder.all(e, pred))
+            }
+            // `e.any(p)` is `!e.all(!p)` (requirement 2.3)
+            #[cfg(feature = "anyall")]
+            "any" => {
+                let arg = extract_single_argument(args.into_iter(), "any", loc)?;
+                let negated = Build::new().with_maybe_source_loc(loc).not(arg);
+                let pred = builder.pred_from_expr(negated).map_err(|err| {
+                    ToASTError::new(ToASTErrorKind::InvalidQuantifierPredicate(err), loc.cloned())
+                })?;
+                let all = Build::new().with_maybe_source_loc(loc).all(e, pred);
+                Ok(builder.not(all))
+            }
             _ => {
                 if ExtStyles::is_method(self) {
                     let args = NonEmpty {
@@ -1165,6 +1209,12 @@ where
         match self {
             Self::Expr { expr, .. } => Ok(expr),
             Self::Var { var, loc } => Ok(Build::new().with_maybe_source_loc(loc.as_ref()).var(var)),
+            // the element keyword `it` of a `.all`/`.any` predicate; a use
+            // outside a predicate is rejected once the whole expression is built
+            #[cfg(feature = "anyall")]
+            Self::Name { name, loc } if is_it_keyword(&name) => {
+                Ok(Build::new().with_maybe_source_loc(loc.as_ref()).item())
+            }
             Self::Name { name, loc } => convert_expr_error_to_parse_error::<Build>(
                 ToASTError::new(
                     ToASTErrorKind::ArbitraryVariable(name.to_string().into()),
@@ -1840,6 +1890,13 @@ impl Node<Option<cst::Member>> {
                 // function.
                 (prim @ (Expr { .. } | StrLit { .. } | BoolLit { .. }), [next, rest @ ..]) => {
                     self.build_expr_accessor::<Build>(prim.into_expr::<Build>()?, next, rest)?
+                }
+
+                // access on the keyword `it`, which is an expression
+                #[cfg(feature = "anyall")]
+                (Name { name, loc }, [next, rest @ ..]) if is_it_keyword(&name) => {
+                    let it = Build::new().with_maybe_source_loc(loc.as_ref()).item();
+                    self.build_expr_accessor::<Build>(it, next, rest)?
                 }
 
                 // function call
@@ -6286,5 +6343,206 @@ mod tests {
         let id = id.unwrap_or_else(|| ast::PolicyID::from_string("policy0"));
         let cst = text_to_cst::parse_policy_tolerant(text)?;
         cst.to_template_tolerant(id)
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+mod anyall_parse_tests {
+    //! Surface syntax and roundtrips for `.all` / `.any` (requirements 1.x, 4.x).
+    use crate::ast::{self, ExprKind, PredFromExprError, UnaryOp};
+    use crate::est;
+    use crate::parser::err::{ParseError, ParseErrors, ToASTErrorKind};
+    use crate::parser::{parse_expr, parse_policy};
+    use crate::pst;
+    use cool_asserts::assert_matches;
+
+    fn kinds(errs: &ParseErrors) -> Vec<ToASTErrorKind> {
+        errs.iter()
+            .filter_map(|e| match e {
+                ParseError::ToAST(e) => Some(e.kind().clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[track_caller]
+    fn roundtrips(src: &str) -> ast::Expr {
+        let e = parse_expr(src).unwrap();
+        let printed = e.to_string();
+        let reparsed = parse_expr(&printed)
+            .unwrap_or_else(|errs| panic!("`{printed}` did not reparse: {errs:?}"));
+        assert!(e.eq_shape(&reparsed), "`{src}` -> `{printed}` changed shape");
+        e
+    }
+
+    #[test]
+    fn all_parses_to_all_node() {
+        let e = roundtrips("[1, 2].all(it > 0)");
+        assert_matches!(e.expr_kind(), ExprKind::All { .. });
+    }
+
+    #[test]
+    fn any_parses_to_not_all_not() {
+        let e = roundtrips("[1, 2].any(it == 2)");
+        assert_matches!(e.expr_kind(), ExprKind::UnaryApp { op: UnaryOp::Not, arg } => {
+            assert_matches!(arg.expr_kind(), ExprKind::All { pred, .. } => {
+                assert_matches!(pred.expr_kind(), ast::PredExprKind::UnaryApp { op: UnaryOp::Not, .. });
+            });
+        });
+    }
+
+    #[test]
+    fn any_matches_its_lowering() {
+        let any = parse_expr("[1, 2].any(it == 2)").unwrap();
+        let lowered = parse_expr("![1, 2].all(!(it == 2))").unwrap();
+        assert!(any.eq_shape(&lowered));
+    }
+
+    #[test]
+    fn it_binds_records_and_request_vars() {
+        roundtrips(r#"resource.owners.all(it.dept == "eng" && it has dept)"#);
+        roundtrips("principal.groups.any(it == principal)");
+        roundtrips(r#"[{a: 1}].all(if it has a then it.a > 0 else false)"#);
+        roundtrips(r#"[ip("10.0.0.1")].all(it.isInRange(ip("10.0.0.0/8")))"#);
+    }
+
+    #[test]
+    fn printed_form() {
+        let e = parse_expr("[1, 2].all(it == 1)").unwrap();
+        assert_eq!(e.to_string(), "[1, 2].all(it == 1)");
+    }
+
+    #[test]
+    fn nested_quantifier_is_rejected() {
+        // requirement 1.4
+        let errs = parse_expr("[[1]].all(it.all(it > 0))").unwrap_err();
+        assert!(kinds(&errs).contains(&ToASTErrorKind::InvalidQuantifierPredicate(
+            PredFromExprError::NestedQuantifier
+        )));
+    }
+
+    #[test]
+    fn set_terms_in_predicate_are_rejected() {
+        // requirement 1.5, statically detectable cases
+        for src in [
+            "[1].all([1, 2].contains(it))",
+            "[1].all(it == [1])",
+            "[[1]].all(it.isEmpty())",
+            "[[1]].all(it.containsAny([1]))",
+        ] {
+            let errs = parse_expr(src).unwrap_err();
+            assert!(
+                kinds(&errs).contains(&ToASTErrorKind::InvalidQuantifierPredicate(
+                    PredFromExprError::SetTerm
+                )),
+                "{src}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn it_outside_predicate_is_rejected() {
+        // requirement 1.6
+        let errs = parse_expr("it == 1").unwrap_err();
+        assert!(kinds(&errs).contains(&ToASTErrorKind::ItOutsidePredicate));
+        let errs = parse_expr("[1].all(it > 0) && it == 1").unwrap_err();
+        assert!(kinds(&errs).contains(&ToASTErrorKind::ItOutsidePredicate));
+        let errs =
+            parse_policy(None, "permit(principal, action, resource) when { it == 1 };").unwrap_err();
+        assert!(kinds(&errs).contains(&ToASTErrorKind::ItOutsidePredicate));
+    }
+
+    #[test]
+    fn it_still_usable_as_attribute_name() {
+        parse_expr("principal.it == 1").unwrap();
+        parse_expr("{it: 1}.it == 1").unwrap();
+        parse_expr("principal has it").unwrap();
+    }
+
+    #[test]
+    fn wrong_arity_is_rejected() {
+        assert!(parse_expr("[1].all()").is_err());
+        assert!(parse_expr("[1].all(it > 0, it > 1)").is_err());
+    }
+
+    #[test]
+    fn policy_with_any_parses() {
+        parse_policy(
+            None,
+            r#"permit(principal, action, resource) when { resource.tags.any(it == "public") };"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn est_roundtrip() {
+        let e = parse_expr(r#"[{d: "eng"}].all(it.d == "eng")"#).unwrap();
+        let est: est::Expr = e.clone().into_expr::<est::Builder>();
+        let json = serde_json::to_value(&est).unwrap();
+        let s = json.to_string();
+        assert!(s.contains("\"all\"") && s.contains("\"it\""), "{s}");
+        let back: est::Expr = serde_json::from_value(json).unwrap();
+        let ast = back.try_into_ast(&ast::PolicyID::from_string("p")).unwrap();
+        assert!(e.eq_shape(&ast));
+    }
+
+    #[test]
+    fn est_rejects_nested_quantifier() {
+        let json = serde_json::json!({
+            "all": {
+                "arg": {"Value": [[1]]},
+                "pred": {"all": {"arg": {"it": {}}, "pred": {"Value": true}}}
+            }
+        });
+        let est: est::Expr = serde_json::from_value(json).unwrap();
+        assert_matches!(
+            est.try_into_ast(&ast::PolicyID::from_string("p")),
+            Err(est::FromJsonError::InvalidQuantifierPredicate(
+                PredFromExprError::NestedQuantifier
+            ))
+        );
+    }
+
+    #[test]
+    fn est_rejects_it_outside_predicate() {
+        let json = serde_json::json!({
+            "effect": "permit",
+            "principal": {"op": "All"},
+            "action": {"op": "All"},
+            "resource": {"op": "All"},
+            "conditions": [{"kind": "when", "body": {"==": {"left": {"it": {}}, "right": {"Value": 1}}}}]
+        });
+        let p: est::Policy = serde_json::from_value(json).unwrap();
+        assert_matches!(
+            p.try_into_ast_policy(None),
+            Err(est::FromJsonError::ItOutsidePredicate)
+        );
+    }
+
+    #[test]
+    fn pst_roundtrip() {
+        let e = parse_expr(r#"resource.tags.any(it like "a*")"#).unwrap();
+        let p = pst::Expr::try_from(e.clone()).unwrap();
+        let back: ast::Expr = p.into();
+        assert!(e.eq_shape(&back));
+    }
+}
+
+#[cfg(all(test, not(feature = "anyall")))]
+mod anyall_off_build_tests {
+    //! Without the `anyall` feature the syntax is rejected as before
+    //! (requirement 3.x) and `it` is an ordinary name.
+    use crate::parser::parse_expr;
+
+    #[test]
+    fn all_and_any_are_not_methods() {
+        assert!(parse_expr("[1].all(principal == principal)").is_err());
+        assert!(parse_expr("[1].any(principal == principal)").is_err());
+    }
+
+    #[test]
+    fn it_is_an_ordinary_name() {
+        parse_expr("principal.it == 1").unwrap();
+        assert!(parse_expr("it == 1").is_err());
     }
 }
