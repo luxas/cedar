@@ -144,6 +144,12 @@ pub enum ExprToResidualError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     ErrorNotSupported(#[from] ErrorNotSupportedError),
+    /// Expression contains a `.all`/`.any` set operator, not yet supported in
+    /// residuals (typed partial evaluation of `.all`/`.any` lands in Phase 6.5).
+    #[cfg(feature = "anyall")]
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    AllNotSupported(#[from] AllNotSupportedError),
 }
 
 /// Error thrown when expression is missing type annotation
@@ -163,6 +169,15 @@ pub struct UnknownNotSupportedError;
 #[derive(Debug, Error, Diagnostic)]
 #[error("expression contains an error node, which is not supported in residuals")]
 pub struct ErrorNotSupportedError;
+
+/// Error thrown when expression contains a `.all`/`.any` set operator, which is
+/// not yet supported in residuals. Typed partial evaluation of `.all`/`.any`
+/// is implemented in Phase 6.5; until then the TPE translation rejects it
+/// conservatively rather than silently mishandling it.
+#[cfg(feature = "anyall")]
+#[derive(Debug, Error, Diagnostic)]
+#[error("expression contains a `.all`/`.any` set operator, which is not yet supported in residuals")]
+pub struct AllNotSupportedError;
 
 /// Error when a request was expected to be concrete
 #[derive(Debug, Error, Diagnostic)]

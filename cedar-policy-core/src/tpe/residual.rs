@@ -25,6 +25,8 @@ use crate::ast::{
 use crate::evaluator::evaluation_errors;
 #[cfg(feature = "tolerant-ast")]
 use crate::tpe::err::ErrorNotSupportedError;
+#[cfg(feature = "anyall")]
+use crate::tpe::err::AllNotSupportedError;
 use crate::tpe::err::{ExprToResidualError, MissingTypeAnnotationError, UnknownNotSupportedError};
 use crate::validator::types::Type;
 use crate::{
@@ -288,6 +290,12 @@ impl Residual {
                 }
             },
             ast::ExprKind::Unknown(_) => return Err(UnknownNotSupportedError.into()),
+            // Phase 6.5 implements typed partial evaluation of `.all`/`.any`
+            // (concrete receiver -> evaluate; residual receiver -> emit a
+            // residual All). Until then the translation rejects it conservatively
+            // rather than silently mishandling it.
+            #[cfg(feature = "anyall")]
+            ast::ExprKind::All { .. } => return Err(AllNotSupportedError.into()),
             #[cfg(feature = "tolerant-ast")]
             ast::ExprKind::Error { .. } => {
                 return Err(ErrorNotSupportedError.into());
