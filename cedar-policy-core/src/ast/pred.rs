@@ -45,6 +45,32 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Name of the reserved unknown that stands for the element keyword `it`
+/// wherever a predicate is temporarily represented as a full [`crate::ast::Expr`]
+/// (while parsing, and while typechecking). It cannot be written in policy
+/// text, and [`PredExprKind`] has no `Unknown` variant, so inside a predicate
+/// it only ever comes from `it`.
+pub const IT_SENTINEL: &str = "__cedar::anyall::it";
+
+/// Whether `e` is the reserved stand-in for `it` (see [`IT_SENTINEL`]).
+pub fn is_it_sentinel<T>(e: &crate::ast::Expr<T>) -> bool {
+    matches!(e.expr_kind(), crate::ast::ExprKind::Unknown(u) if u.name == IT_SENTINEL)
+}
+
+/// Why an expression cannot be used as a `.all`/`.any` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PredFromExprError {
+    /// The predicate contains another `.all`/`.any`.
+    #[error("`.all`/`.any` predicates cannot contain another `.all`/`.any`")]
+    NestedQuantifier,
+    /// The predicate contains a set literal or a set operator.
+    #[error("`.all`/`.any` predicates cannot use set literals or set operators")]
+    SetTerm,
+    /// The predicate contains a template slot or an unknown.
+    #[error("`.all`/`.any` predicates cannot contain template slots or unknowns")]
+    Unsupported,
+}
+
 /// A restricted predicate expression over the current set element `it`.
 ///
 /// Mirrors [`crate::ast::Expr`]'s shape (an inner [`PredExprKind`], an optional
@@ -677,20 +703,20 @@ impl<T: Clone + Default> PredExpr<T> {
     }
 
     /// Inverse of [`Self::instantiate_with`]: rebuild a predicate from an
-    /// instantiated expression, turning every sub-expression for which
-    /// `is_item` holds back into `it`. Returns `None` if the expression has a
-    /// node with no predicate counterpart (a set, slot, other unknown, or a
-    /// nested quantifier).
-    pub fn from_instantiated(
+    /// expression, turning every sub-expression for which `is_item` holds
+    /// into `it`. Fails if the expression has a nested quantifier, a set term
+    /// (set literal, `contains`/`containsAll`/`containsAny`/`isEmpty`), or a
+    /// node a predicate cannot hold (a slot, or any other unknown).
+    pub fn try_from_expr(
         e: &crate::ast::Expr<T>,
         is_item: &impl Fn(&crate::ast::Expr<T>) -> bool,
-    ) -> Option<Self> {
+    ) -> Result<Self, PredFromExprError> {
         use crate::ast::ExprKind as E;
         use PredExprKind::*;
         if is_item(e) {
-            return Some(Self::new(Item, e.source_loc().cloned(), e.data().clone()));
+            return Ok(Self::new(Item, e.source_loc().cloned(), e.data().clone()));
         }
-        let rec = |x: &crate::ast::Expr<T>| Self::from_instantiated(x, is_item).map(Arc::new);
+        let rec = |x: &crate::ast::Expr<T>| Self::try_from_expr(x, is_item).map(Arc::new);
         let kind = match e.expr_kind() {
             E::Lit(l) => Lit(l.clone()),
             E::Var(v) => Var(*v),
@@ -711,6 +737,15 @@ impl<T: Clone + Default> PredExpr<T> {
                 left: rec(left)?,
                 right: rec(right)?,
             },
+            E::UnaryApp {
+                op: UnaryOp::IsEmpty,
+                ..
+            }
+            | E::BinaryApp {
+                op: BinaryOp::Contains | BinaryOp::ContainsAll | BinaryOp::ContainsAny,
+                ..
+            }
+            | E::Set(_) => return Err(PredFromExprError::SetTerm),
             E::UnaryApp { op, arg } => UnaryApp {
                 op: *op,
                 arg: rec(arg)?,
@@ -724,8 +759,8 @@ impl<T: Clone + Default> PredExpr<T> {
                 fn_name: fn_name.clone(),
                 args: Arc::new(
                     args.iter()
-                        .map(|a| Self::from_instantiated(a, is_item))
-                        .collect::<Option<Vec<_>>>()?,
+                        .map(|a| Self::try_from_expr(a, is_item))
+                        .collect::<Result<Vec<_>, _>>()?,
                 ),
             },
             E::GetAttr { expr, attr } => GetAttr {
@@ -750,12 +785,15 @@ impl<T: Clone + Default> PredExpr<T> {
             },
             E::Record(map) => Record(Arc::new(
                 map.iter()
-                    .map(|(k, v)| Some((k.clone(), Self::from_instantiated(v, is_item)?)))
-                    .collect::<Option<BTreeMap<_, _>>>()?,
+                    .map(|(k, v)| Ok((k.clone(), Self::try_from_expr(v, is_item)?)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
             )),
-            _ => return None,
+            E::All { .. } => return Err(PredFromExprError::NestedQuantifier),
+            E::Slot(_) | E::Unknown(_) => return Err(PredFromExprError::Unsupported),
+            #[cfg(feature = "tolerant-ast")]
+            E::Error { .. } => return Err(PredFromExprError::Unsupported),
         };
-        Some(Self::new(kind, e.source_loc().cloned(), e.data().clone()))
+        Ok(Self::new(kind, e.source_loc().cloned(), e.data().clone()))
     }
 
     fn new(expr_kind: PredExprKind<T>, source_loc: Option<Loc>, data: T) -> Self {

@@ -404,6 +404,22 @@ pub enum ExprNoExt {
     /// AST Error node - this represents a parsing error in a partially generated AST
     #[cfg(feature = "tolerant-ast")]
     Error(AstExprErrorKind),
+    /// `arg.all(pred)`: `pred` holds for every element of the set `arg`. The
+    /// predicate is a full expression in the EST; it is checked (no nested
+    /// quantifier, no set terms) on conversion to the AST. `arg.any(pred)` is
+    /// represented as `!arg.all(!pred)`.
+    #[cfg(feature = "anyall")]
+    #[serde(rename = "all")]
+    All {
+        /// Set to quantify over
+        arg: Arc<Expr>,
+        /// Predicate over the element keyword `it`
+        pred: Arc<Expr>,
+    },
+    /// The element keyword `it`, valid only inside the predicate of `all`
+    #[cfg(feature = "anyall")]
+    #[serde(rename = "it")]
+    It {},
 }
 
 /// Serde JSON structure for an extension function call in the EST format
@@ -471,7 +487,7 @@ impl ExprBuilder for Builder {
     type BuildError = Infallible;
     type Data = ();
     #[cfg(feature = "anyall")]
-    type Pred = crate::ast::PredExpr;
+    type Pred = Expr;
     #[cfg(feature = "tolerant-ast")]
     type ErrorType = Infallible;
 
@@ -492,20 +508,29 @@ impl ExprBuilder for Builder {
     }
 
     #[cfg(feature = "anyall")]
-    #[expect(
-        clippy::unreachable,
-        reason = "EST `all` form lands in Phase 4; nothing constructs an EST `All` to build in Phase 1, so this is dead code"
-    )]
-    fn all(self, _expr: Self::Expr, _pred: Self::Pred) -> Self::Expr {
-        unreachable!("EST `all` form is introduced in Phase 4 (surface syntax + roundtrip)")
+    fn all(self, expr: Expr, pred: Expr) -> Expr {
+        Expr::ExprNoExt(ExprNoExt::All {
+            arg: Arc::new(expr),
+            pred: Arc::new(pred),
+        })
     }
 
     #[cfg(feature = "anyall")]
-    fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred {
-        // Harmless: lift to the AST predicate (the EST `Pred` type). Only ever
-        // reached from `Expr::try_into_expr`, which in Phase 1 never converts an
-        // AST `All` into EST, but returning a value avoids any panic risk.
-        pred.with_default_data()
+    fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Expr {
+        let item = ast::ExprBuilder::<()>::new().item();
+        pred.with_default_data::<()>()
+            .instantiate_with(&item)
+            .into_expr::<Builder>()
+    }
+
+    #[cfg(feature = "anyall")]
+    fn item(self) -> Expr {
+        Expr::ExprNoExt(ExprNoExt::It {})
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_expr(&self, e: Expr) -> Result<Expr, crate::ast::PredFromExprError> {
+        Ok(e)
     }
 
     /// literal
@@ -525,6 +550,10 @@ impl ExprBuilder for Builder {
 
     /// An extension call with one arg, which is the name of the unknown
     fn unknown(self, u: ast::Unknown) -> Expr {
+        #[cfg(feature = "anyall")]
+        if u.name == crate::ast::IT_SENTINEL {
+            return self.item();
+        }
         Expr::ExtFuncCall(ExtFuncCall {
             call: HashMap::from([("unknown".to_smolstr(), vec![Builder::new().val(u.name)])]),
         })
@@ -823,6 +852,13 @@ impl Expr {
                 ExprNoExt::Value(v) => Ok(Expr::ExprNoExt(ExprNoExt::Value(
                     v.sub_entity_literals(mapping)?,
                 ))),
+                #[cfg(feature = "anyall")]
+                ExprNoExt::All { arg, pred } => Ok(Expr::ExprNoExt(ExprNoExt::All {
+                    arg: Arc::new(Arc::unwrap_or_clone(arg).sub_entity_literals(mapping)?),
+                    pred: Arc::new(Arc::unwrap_or_clone(pred).sub_entity_literals(mapping)?),
+                })),
+                #[cfg(feature = "anyall")]
+                ExprNoExt::It {} => Ok(Expr::ExprNoExt(ExprNoExt::It {})),
                 v @ ExprNoExt::Var(_) => Ok(Expr::ExprNoExt(v)),
                 s @ ExprNoExt::Slot(_) => Ok(Expr::ExprNoExt(s)),
                 ExprNoExt::Not { arg } => Ok(Expr::ExprNoExt(ExprNoExt::Not {
@@ -1028,6 +1064,13 @@ impl Expr {
                         max_depth = max_depth.max(value_height);
                     }
                     ExprNoExt::Var(_) | ExprNoExt::Slot(_) => {}
+                    #[cfg(feature = "anyall")]
+                    ExprNoExt::It {} => {}
+                    #[cfg(feature = "anyall")]
+                    ExprNoExt::All { arg, pred } => {
+                        stack.push((arg, child_depth));
+                        stack.push((pred, child_depth));
+                    }
                     #[cfg(feature = "tolerant-ast")]
                     ExprNoExt::Error(_) => {}
                     ExprNoExt::Not { arg }
@@ -1142,6 +1185,17 @@ impl Expr {
             }
             Expr::ExprNoExt(ExprNoExt::Var(var)) => Ok(builder.var(var)),
             Expr::ExprNoExt(ExprNoExt::Slot(slot)) => Ok(builder.slot(slot)),
+            #[cfg(feature = "anyall")]
+            Expr::ExprNoExt(ExprNoExt::It {}) => Ok(builder.item()),
+            #[cfg(feature = "anyall")]
+            Expr::ExprNoExt(ExprNoExt::All { arg, pred }) => {
+                let arg = Arc::unwrap_or_clone(arg).try_into_expr::<B>()?;
+                let pred = Arc::unwrap_or_clone(pred).try_into_expr::<B>()?;
+                let pred = builder
+                    .pred_from_expr(pred)
+                    .map_err(FromJsonError::InvalidQuantifierPredicate)?;
+                Ok(builder.all(arg, pred))
+            }
             Expr::ExprNoExt(ExprNoExt::Not { arg }) => {
                 Ok(builder.not(Arc::unwrap_or_clone(arg).try_into_expr::<B>()?))
             }
@@ -1310,6 +1364,16 @@ impl Expr {
                 .map_err(Into::into),
             Expr::ExprNoExt(ExprNoExt::Var(var)) => Ok(ast::Expr::var(var)),
             Expr::ExprNoExt(ExprNoExt::Slot(slot)) => Ok(ast::Expr::slot(slot)),
+            #[cfg(feature = "anyall")]
+            Expr::ExprNoExt(ExprNoExt::It {}) => Ok(ast::ExprBuilder::new().item()),
+            #[cfg(feature = "anyall")]
+            Expr::ExprNoExt(ExprNoExt::All { arg, pred }) => {
+                let arg = Arc::unwrap_or_clone(arg).try_into_ast(id)?;
+                let pred = Arc::unwrap_or_clone(pred).try_into_ast(id)?;
+                let pred = ast::PredExpr::try_from_expr(&pred, &ast::is_it_sentinel)
+                    .map_err(FromJsonError::InvalidQuantifierPredicate)?;
+                Ok(ast::Expr::all(arg, pred))
+            }
             Expr::ExprNoExt(ExprNoExt::Not { arg }) => {
                 Ok(ast::Expr::not(Arc::unwrap_or_clone(arg).try_into_ast(id)?))
             }
@@ -1683,6 +1747,15 @@ impl BoundedDisplay for ExprNoExt {
             ExprNoExt::Value(v) => display_cedarvaluejson(f, v, n),
             ExprNoExt::Var(v) => write!(f, "{v}"),
             ExprNoExt::Slot(id) => write!(f, "{id}"),
+            #[cfg(feature = "anyall")]
+            ExprNoExt::It {} => write!(f, "it"),
+            #[cfg(feature = "anyall")]
+            ExprNoExt::All { arg, pred } => {
+                maybe_with_parens(f, arg, n)?;
+                write!(f, ".all(")?;
+                BoundedDisplay::fmt(pred.as_ref(), f, n)?;
+                write!(f, ")")
+            }
             ExprNoExt::Not { arg } => {
                 write!(f, "!")?;
                 maybe_with_parens(f, arg, n)
@@ -1988,6 +2061,12 @@ fn maybe_with_parens(
     n: Option<usize>,
 ) -> std::fmt::Result {
     match expr {
+        // `it` is a keyword and `.all(..)` is a method call, both of which
+        // bind tighter than every operator
+        #[cfg(feature = "anyall")]
+        Expr::ExprNoExt(ExprNoExt::It {}) | Expr::ExprNoExt(ExprNoExt::All { .. }) => {
+            BoundedDisplay::fmt(expr, f, n)
+        }
         Expr::ExprNoExt(ExprNoExt::Set(_)) |
         Expr::ExprNoExt(ExprNoExt::Record(_)) |
         Expr::ExprNoExt(ExprNoExt::Value(_)) |
