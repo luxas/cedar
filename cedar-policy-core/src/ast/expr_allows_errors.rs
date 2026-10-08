@@ -71,6 +71,21 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprWithErrsBuilder<T> {
         pred.with_default_data()
     }
 
+    #[cfg(feature = "anyall")]
+    fn item(self) -> Expr<T> {
+        self.with_expr_kind(ExprKind::Unknown(Unknown::new_untyped(
+            crate::ast::IT_SENTINEL,
+        )))
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_expr(
+        &self,
+        e: Expr<T>,
+    ) -> Result<PredExpr<T>, crate::ast::PredFromExprError> {
+        PredExpr::try_from_expr(&e, &crate::ast::is_it_sentinel)
+    }
+
     fn with_data(data: T) -> Self {
         Self {
             source_loc: None,

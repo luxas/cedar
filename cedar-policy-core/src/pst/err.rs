@@ -132,6 +132,15 @@ impl From<est::FromJsonError> for PstConstructionError {
                 // Show just first error in main error message, like original err
                 error_body::ParsingFailedError::new(e.head.to_string()).into()
             }
+            #[cfg(feature = "anyall")]
+            est::FromJsonError::InvalidQuantifierPredicate(e) => {
+                error_body::ParsingFailedError::new(e.to_string()).into()
+            }
+            #[cfg(feature = "anyall")]
+            est::FromJsonError::ItOutsidePredicate => error_body::ParsingFailedError::new(
+                est::FromJsonError::ItOutsidePredicate.to_string(),
+            )
+            .into(),
 
             // Errors below should not occur in normal expression conversion paths, but we still
             // map them to the closest PST error for completeness.

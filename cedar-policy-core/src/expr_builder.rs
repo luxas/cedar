@@ -279,6 +279,21 @@ pub trait ExprBuilder: Clone {
     #[cfg(feature = "anyall")]
     fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred;
 
+    /// Create the element keyword `it`, valid only inside a `.all`/`.any`
+    /// predicate (see [`Self::pred_from_expr`]).
+    #[cfg(feature = "anyall")]
+    fn item(self) -> Self::Expr;
+
+    /// Turn an expression built with this builder (possibly containing
+    /// [`Self::item`]) into the predicate of a `.all`/`.any`. Builders whose
+    /// predicate form is a full expression accept anything here and leave the
+    /// checks to the conversion into the AST.
+    #[cfg(feature = "anyall")]
+    fn pred_from_expr(
+        &self,
+        e: Self::Expr,
+    ) -> Result<Self::Pred, crate::ast::PredFromExprError>;
+
     /// Create an `_ is _ in _`  expression
     fn is_in_entity_type(
         self,

@@ -84,6 +84,14 @@ pub enum FromJsonError {
     #[cfg(feature = "tolerant-ast")]
     #[error("AST error node")]
     ASTErrorNode,
+    /// The predicate of an `all` is not a valid set-quantifier predicate
+    #[cfg(feature = "anyall")]
+    #[error("invalid `all` predicate: {0}")]
+    InvalidQuantifierPredicate(crate::ast::PredFromExprError),
+    /// The element keyword `it` was used outside the predicate of an `all`
+    #[cfg(feature = "anyall")]
+    #[error("`it` can only be used inside the predicate of `.all` or `.any`")]
+    ItOutsidePredicate,
 }
 
 /// Errors arising while converting a policy set from its JSON representation (aka EST) into an AST

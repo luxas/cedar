@@ -1483,6 +1483,21 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprBuilder<T> {
         pred.with_default_data()
     }
 
+    #[cfg(feature = "anyall")]
+    fn item(self) -> Expr<T> {
+        self.with_expr_kind(ExprKind::Unknown(Unknown::new_untyped(
+            crate::ast::IT_SENTINEL,
+        )))
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_expr(
+        &self,
+        e: Expr<T>,
+    ) -> Result<PredExpr<T>, crate::ast::PredFromExprError> {
+        PredExpr::try_from_expr(&e, &crate::ast::is_it_sentinel)
+    }
+
     /// Create an extended has expression directly in the AST without desugaring.
     fn extended_has_attr_arc(self, expr: Arc<Expr<T>>, attrs: NonEmpty<SmolStr>) -> Expr<T> {
         // If there's only one attribute, create a simple HasAttr node

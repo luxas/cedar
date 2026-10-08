@@ -412,6 +412,28 @@ impl TryFrom<models::Expr> for ast::Expr {
                     ProtobufConversionError::InvalidValue(format!("invalid record: {e}"))
                 })?
             }
+
+            #[cfg(feature = "anyall")]
+            models::expr::ExprKind::All(msg) => {
+                let arg = *msg
+                    .arg
+                    .ok_or_else(|| ProtobufConversionError::missing("arg"))?;
+                let pred = *msg
+                    .pred
+                    .ok_or_else(|| ProtobufConversionError::missing("pred"))?;
+                // the bytes are untrusted: re-check the predicate
+                let pred = ast::PredExpr::try_from_expr(&ast::Expr::try_from(pred)?, &ast::is_it_sentinel)
+                    .map_err(|e| ProtobufConversionError::InvalidValue(format!("invalid `all` predicate: {e}")))?;
+                ast::Expr::all(ast::Expr::try_from(arg)?, pred)
+            }
+            #[cfg(feature = "anyall")]
+            models::expr::ExprKind::Item(_) => ast::Expr::unknown(ast::Unknown::new_untyped(ast::IT_SENTINEL)),
+            #[cfg(not(feature = "anyall"))]
+            models::expr::ExprKind::All(_) | models::expr::ExprKind::Item(_) => {
+                return Err(ProtobufConversionError::InvalidValue(
+                    "`.all`/`.any` requires the `anyall` feature".into(),
+                ))
+            }
         };
         Ok(expr)
     }
@@ -425,6 +447,10 @@ impl From<&ast::Expr> for models::Expr {
     )]
     fn from(v: &ast::Expr) -> Self {
         let expr_kind = match v.expr_kind() {
+            #[cfg(feature = "anyall")]
+            ast::ExprKind::Unknown(u) if u.name == ast::IT_SENTINEL => {
+                models::expr::ExprKind::Item(models::expr::Item {})
+            }
             ast::ExprKind::Lit(l) => {
                 models::expr::ExprKind::Lit(models::expr::Literal::from(l))
             }
@@ -530,9 +556,15 @@ impl From<&ast::Expr> for models::Expr {
                 models::expr::ExprKind::Record(models::expr::Record { items: precord })
             },
             #[cfg(feature = "anyall")]
-            ast::ExprKind::All { .. } => unimplemented!(
-                "Protobuf serialization of `.all`/`.any` set operators is not yet supported (deferred past Phase 1)"
-            ),
+            ast::ExprKind::All { expr, pred } => {
+                let pred = pred.instantiate_with(&ast::Expr::unknown(ast::Unknown::new_untyped(
+                    ast::IT_SENTINEL,
+                )));
+                models::expr::ExprKind::All(Box::new(models::expr::All {
+                    arg: Some(Box::new(models::Expr::from(expr.as_ref()))),
+                    pred: Some(Box::new(models::Expr::from(&pred))),
+                }))
+            }
             #[cfg(feature="tolerant-ast")]
             ast::ExprKind::Error { .. } => unimplemented!("Protobufs feature not compatible with ASTs that contain error nodes - this should never happen"),
         };
@@ -1469,6 +1501,56 @@ mod test {
         assert_matches!(
             ast::Context::try_from(bad),
             Err(ProtobufConversionError::MissingField(f)) if f == "expr_kind"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+mod anyall_test {
+    //! Protobuf round trip of `.all` / `.any` (requirement 4.2).
+    use super::*;
+    use cool_asserts::assert_matches;
+    use prost::Message;
+
+    #[track_caller]
+    fn roundtrip(src: &str) {
+        let e: ast::Expr = src.parse().unwrap();
+        let bytes = models::Expr::from(&e).encode_to_vec();
+        let back = ast::Expr::try_from(models::Expr::decode(bytes.as_slice()).unwrap()).unwrap();
+        assert!(e.eq_shape(&back), "{src}: {e} != {back}");
+    }
+
+    #[test]
+    fn all_and_any_roundtrip() {
+        roundtrip("[1, 2].all(it > 0)");
+        roundtrip(r#"resource.owners.any(it.dept == "eng" && it has dept)"#);
+        roundtrip(r#"[{a: 1}].all(if it has a then it.a == principal.n else false)"#);
+    }
+
+    fn all_with_pred(pred: models::Expr) -> models::Expr {
+        models::Expr {
+            expr_kind: Some(models::expr::ExprKind::All(Box::new(models::expr::All {
+                arg: Some(Box::new(models::Expr::from(&ast::Expr::set([ast::Expr::val(1)])))),
+                pred: Some(Box::new(pred)),
+            }))),
+        }
+    }
+
+    #[test]
+    fn untrusted_nested_quantifier_is_rejected() {
+        let inner = models::Expr::from(&"[1].all(it > 0)".parse::<ast::Expr>().unwrap());
+        assert_matches!(
+            ast::Expr::try_from(all_with_pred(inner)),
+            Err(ProtobufConversionError::InvalidValue(_))
+        );
+    }
+
+    #[test]
+    fn untrusted_set_term_is_rejected() {
+        let set = models::Expr::from(&ast::Expr::set([ast::Expr::val(1)]));
+        assert_matches!(
+            ast::Expr::try_from(all_with_pred(set)),
+            Err(ProtobufConversionError::InvalidValue(_))
         );
     }
 }

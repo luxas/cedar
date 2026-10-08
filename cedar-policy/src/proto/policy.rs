@@ -177,7 +177,17 @@ impl TryFrom<models::TemplateBody> for ast::TemplateBody {
                     .ok_or_else(|| ProtobufConversionError::missing("resource_constraint"))?,
             )?,
             v.non_scope_constraints
-                .map(ast::Expr::try_from)
+                .map(|e| {
+                    let e = ast::Expr::try_from(e)?;
+                    // `it` is only meaningful inside an `all` predicate
+                    #[cfg(feature = "anyall")]
+                    if e.subexpressions().any(ast::is_it_sentinel) {
+                        return Err(ProtobufConversionError::InvalidValue(
+                            "`it` used outside a `.all`/`.any` predicate".into(),
+                        ));
+                    }
+                    Ok(e)
+                })
                 .transpose()?,
         ))
     }

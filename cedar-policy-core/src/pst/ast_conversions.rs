@@ -501,6 +501,12 @@ impl Expr {
                 name,
                 type_annotation: None,
             }),
+            #[cfg(feature = "anyall")]
+            Expr::All { arg, pred } => {
+                let arg = Arc::unwrap_or_clone(arg).into_expr::<B>();
+                let pred = builder.pred_from_ast(pred.as_ref());
+                builder.all(arg, pred)
+            }
             #[cfg(feature = "tpe")]
             Expr::ResidualError => builder
                 .call_extension_fn(crate::tpe::residual::ERROR_NAME.clone(), std::iter::empty())

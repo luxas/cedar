@@ -437,6 +437,15 @@ impl EncodeCheck for models::Expr {
                             }
                         }
                     }
+                    ExprKind::All(all) => {
+                        if let Some(ref e) = all.arg {
+                            stack.push((e, child_depth));
+                        }
+                        if let Some(ref e) = all.pred {
+                            stack.push((e, child_depth));
+                        }
+                    }
+                    ExprKind::Item(_) => {}
                     ExprKind::Set(set) => {
                         for elem in &set.elements {
                             stack.push((elem, child_depth));

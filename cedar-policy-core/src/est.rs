@@ -325,6 +325,10 @@ impl Policy {
 
 impl Clause {
     fn filter_slots(e: ast::Expr, is_when: bool) -> Result<ast::Expr, FromJsonError> {
+        #[cfg(feature = "anyall")]
+        if e.subexpressions().any(ast::is_it_sentinel) {
+            return Err(FromJsonError::ItOutsidePredicate);
+        }
         let first_slot = e.slots().next();
         if let Some(slot) = first_slot {
             Err(parse_errors::SlotsInConditionClause {

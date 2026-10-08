@@ -253,6 +253,18 @@ pub enum ToASTErrorKind {
     #[error("`{0}` is a function, not a method")]
     #[diagnostic(help("use a function-style call `{0}(..)`"))]
     MethodCallOnFunction(ast::UnreservedId),
+    /// Returned when the argument of `.all(..)` / `.any(..)` is not a valid
+    /// set-quantifier predicate
+    #[cfg(feature = "anyall")]
+    #[error("invalid `.all`/`.any` predicate: {0}")]
+    #[diagnostic(help(
+        "a predicate may use `it`, request variables, literals and non-set operators, but no set literals, set operators, or nested `.all`/`.any`"
+    ))]
+    InvalidQuantifierPredicate(crate::ast::PredFromExprError),
+    /// Returned when the keyword `it` is used outside a `.all`/`.any` predicate
+    #[cfg(feature = "anyall")]
+    #[error("`it` can only be used inside the predicate of `.all(..)` or `.any(..)`")]
+    ItOutsidePredicate,
     /// Returned when the right hand side of a `like` expression is not a constant pattern literal
     #[error("right hand side of a `like` expression must be a pattern literal, but got `{0}`")]
     InvalidPattern(String),

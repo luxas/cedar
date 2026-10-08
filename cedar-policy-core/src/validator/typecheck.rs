@@ -337,12 +337,10 @@ struct SingleEnvTypechecker<'a> {
     it_type: Option<Type>,
 }
 
-/// Name of the unknown that stands for `it` when a set-quantifier predicate is
-/// instantiated for typechecking. It cannot be written in policy text, and
-/// `PredExprKind` has no `Unknown` variant, so this name is only ever produced
-/// by `PredExpr::instantiate_with`. Revisit if `PredExpr` gains an unknown leaf.
+/// Reserved name standing for `it` while a predicate is typechecked
+/// (see [`crate::ast::IT_SENTINEL`]).
 #[cfg(feature = "anyall")]
-pub(crate) const IT_PLACEHOLDER: &str = "__cedar::anyall::it";
+pub(crate) const IT_PLACEHOLDER: &str = crate::ast::IT_SENTINEL;
 
 impl<'a> SingleEnvTypechecker<'a> {
     /// This method handles the majority of the work. Given an expression, and
@@ -1316,9 +1314,7 @@ impl<'a> SingleEnvTypechecker<'a> {
                     let typed_pred = typed_inst
                         .as_ref()
                         .and_then(|t| {
-                            crate::ast::PredExpr::from_instantiated(t, &|x| {
-                                matches!(x.expr_kind(), ExprKind::Unknown(u) if u.name == IT_PLACEHOLDER)
-                            })
+                            crate::ast::PredExpr::try_from_expr(t, &crate::ast::is_it_sentinel).ok()
                         })
                         .unwrap_or_else(|| pred.as_ref().with_default_data());
                     if has_set_term {

@@ -780,6 +780,16 @@ pub enum Expr {
         /// Name of the unknown
         name: SmolStr,
     },
+    /// `arg.all(pred)`: `pred` holds for every element of the set `arg`.
+    /// `arg.any(pred)` is represented as `!arg.all(!pred)`. The predicate is
+    /// held in its checked AST form, so it is set-free and non-nested.
+    #[cfg(feature = "anyall")]
+    All {
+        /// Set to quantify over
+        arg: Arc<Expr>,
+        /// Predicate over the element keyword `it`
+        pred: Arc<crate::ast::PredExpr>,
+    },
     /// A TPE residual error node: indicates that this subexpression would
     /// produce an evaluation error if reached at runtime.
     ///
@@ -942,6 +952,10 @@ impl Expr {
             Expr::VariadicOp { left, rights, .. } => rights
                 .iter()
                 .fold(recurse(left), |acc, e| op(acc, recurse(e))),
+            // The predicate is a checked AST predicate, which has no slots,
+            // unknowns or residual errors, so only the receiver is visited.
+            #[cfg(feature = "anyall")]
+            Expr::All { arg, .. } => recurse(arg),
         }
     }
 
@@ -1037,19 +1051,34 @@ impl ExprBuilder for PstBuilder {
     }
 
     #[cfg(feature = "anyall")]
-    #[expect(
-        clippy::unreachable,
-        reason = "PST `all` form lands in Phase 4; nothing constructs a PST `All` to build in Phase 1, so this is dead code"
-    )]
-    fn all(self, _expr: Self::Expr, _pred: Self::Pred) -> Self::Expr {
-        unreachable!("PST `all` form is introduced in Phase 4 (surface syntax + roundtrip)")
+    fn all(self, expr: Self::Expr, pred: Self::Pred) -> Self::Expr {
+        Expr::All {
+            arg: Arc::new(expr),
+            pred: Arc::new(pred),
+        }
     }
 
     #[cfg(feature = "anyall")]
     fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred {
-        // Harmless lift; only reachable from `Expr::try_into_expr`, which never
-        // converts an AST `All` into PST in Phase 1.
         pred.with_default_data()
+    }
+
+    /// The PST has no `it` node outside a predicate; while an `all` is being
+    /// built, `it` is the reserved unknown [`crate::ast::IT_SENTINEL`].
+    #[cfg(feature = "anyall")]
+    fn item(self) -> Self::Expr {
+        Expr::Unknown {
+            name: crate::ast::IT_SENTINEL.into(),
+        }
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_expr(
+        &self,
+        e: Self::Expr,
+    ) -> Result<Self::Pred, crate::ast::PredFromExprError> {
+        let e: crate::ast::Expr = e.into();
+        crate::ast::PredExpr::try_from_expr(&e, &crate::ast::is_it_sentinel)
     }
 
     fn val(self, lit: impl Into<ast::Literal>) -> Expr {
