@@ -578,6 +578,57 @@ impl<T: Clone> PredExpr<T> {
     }
 }
 
+impl PredExpr {
+    /// Instantiate this predicate for one set element: every `it`
+    /// ([`PredExprKind::Item`]) becomes the element, embedded as an [`Expr`]
+    /// via `From<Value> for Expr`, and every other node maps to its `ExprKind`
+    /// counterpart. Evaluating the result is evaluating the predicate with
+    /// `it` bound to `elem`.
+    pub fn instantiate(&self, elem: &crate::ast::Value) -> crate::ast::Expr {
+        use crate::ast::Expr;
+        use PredExprKind::*;
+        match self.expr_kind() {
+            Item => Expr::from(elem.clone()),
+            Lit(l) => Expr::val(l.clone()),
+            Var(v) => Expr::var(*v),
+            If {
+                test_expr,
+                then_expr,
+                else_expr,
+            } => Expr::ite(
+                test_expr.instantiate(elem),
+                then_expr.instantiate(elem),
+                else_expr.instantiate(elem),
+            ),
+            And { left, right } => Expr::and(left.instantiate(elem), right.instantiate(elem)),
+            Or { left, right } => Expr::or(left.instantiate(elem), right.instantiate(elem)),
+            UnaryApp { op, arg } => Expr::unary_app(*op, arg.instantiate(elem)),
+            BinaryApp { op, arg1, arg2 } => {
+                Expr::binary_app(*op, arg1.instantiate(elem), arg2.instantiate(elem))
+            }
+            ExtensionFunctionApp { fn_name, args } => Expr::call_extension_fn(
+                fn_name.clone(),
+                args.iter().map(|a| a.instantiate(elem)).collect(),
+            ),
+            GetAttr { expr, attr } => Expr::get_attr(expr.instantiate(elem), attr.clone()),
+            HasAttr { expr, attr } => Expr::has_attr(expr.instantiate(elem), attr.clone()),
+            ExtHasAttr { expr, attrs } => {
+                Expr::extended_has_attr(expr.instantiate(elem), attrs.clone())
+            }
+            Like { expr, pattern } => Expr::like(expr.instantiate(elem), pattern.clone()),
+            Is { expr, entity_type } => {
+                Expr::is_entity_type(expr.instantiate(elem), entity_type.clone())
+            }
+            #[expect(
+                clippy::expect_used,
+                reason = "the keys come from a BTreeMap, so there are no duplicates"
+            )]
+            Record(map) => Expr::record(map.iter().map(|(k, v)| (k.clone(), v.instantiate(elem))))
+                .expect("the keys come from a BTreeMap, so there are no duplicates"),
+        }
+    }
+}
+
 /// The only public way to build a [`PredExpr`]. Smart constructors reject the
 /// set-valued operators so an analyzable predicate cannot be built with one.
 #[derive(Clone, Debug)]

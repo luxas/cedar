@@ -777,12 +777,53 @@ impl<'e> Evaluator<'e> {
                 }
             }
             #[cfg(feature = "anyall")]
-            ExprKind::All { .. } => {
-                // Phase 3 implements `.all`/`.any` evaluation (element binding
-                // + short-circuiting). In Phase 1 the node is construct-only and
-                // no parser produces one, so reaching the evaluator is treated
-                // as a non-value residual rather than a crash.
-                Err(err::EvaluationError::non_value(expr.clone()))
+            ExprKind::All { expr: recv, pred } => {
+                // Semantics match the Lean spec (`evalAll`): a non-set receiver
+                // is a type error and a receiver error propagates unchanged;
+                // any element whose predicate errors or is not a boolean makes
+                // the whole expression a payload-free `QuantifierError`;
+                // otherwise the result is the conjunction (`true` when empty).
+                // There is no short-circuit on `false`, because a later element
+                // may still error (requirements 2.5/2.8).
+                match self.partial_interpret(recv, slots)? {
+                    PartialValue::Residual(r) => {
+                        Ok(PartialValue::Residual(Expr::all(r, pred.as_ref().clone())))
+                    }
+                    PartialValue::Value(v) => {
+                        let set = v.get_as_set()?;
+                        let mut all_true = true;
+                        let mut residual = false;
+                        for elem in set.iter() {
+                            match self.partial_interpret(&pred.instantiate(elem), slots) {
+                                // An implementation limit, not a predicate
+                                // error: propagate it as is.
+                                Err(e @ EvaluationError::RecursionLimit(_)) => return Err(e),
+                                Err(_) => {
+                                    return Err(EvaluationError::quantifier_error(loc.cloned()))
+                                }
+                                Ok(PartialValue::Value(b)) => match b.get_as_bool() {
+                                    Ok(b) => all_true &= b,
+                                    Err(_) => {
+                                        return Err(EvaluationError::quantifier_error(
+                                            loc.cloned(),
+                                        ))
+                                    }
+                                },
+                                Ok(PartialValue::Residual(_)) => residual = true,
+                            }
+                        }
+                        if residual {
+                            // Conservative: keep the whole node symbolic, since
+                            // a residual element could still error later.
+                            Ok(PartialValue::Residual(Expr::all(
+                                Expr::from(v.clone()),
+                                pred.as_ref().clone(),
+                            )))
+                        } else {
+                            Ok(all_true.into())
+                        }
+                    }
+                }
             }
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => Err(ASTErrorExpr(ASTErrorExprError {
@@ -6712,5 +6753,197 @@ pub(crate) mod test {
         let e = Expr::is_eq(Expr::var(Var::Principal), Expr::var(Var::Resource));
         let r = eval.partial_eval_expr(&e).unwrap();
         assert_eq!(r, Either::Left(Value::from(false)));
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+mod anyall_test {
+    //! Parity tests for `.all` / `.any`, mirroring the Lean spec tests in
+    //! `cedar-lean/UnitTest/AnyAll.lean` (requirements 2.1-2.8).
+    use super::test::{basic_entities, basic_request};
+    use super::*;
+    use crate::ast::{PredExpr, PredExprBuilder, Unknown};
+    use cool_asserts::assert_matches;
+
+    fn pb() -> PredExprBuilder {
+        PredExprBuilder::new()
+    }
+
+    /// `0 < it` (type error on a non-integer element)
+    fn it_pos() -> PredExpr {
+        pb().binary_app(BinaryOp::Less, pb().val(0), pb().item()).unwrap()
+    }
+
+    /// `1 < it`
+    fn it_gt1() -> PredExpr {
+        pb().binary_app(BinaryOp::Less, pb().val(1), pb().item()).unwrap()
+    }
+
+    /// `it == 2`
+    fn it_eq2() -> PredExpr {
+        pb().binary_app(BinaryOp::Eq, pb().item(), pb().val(2)).unwrap()
+    }
+
+    /// `if it == 0 then false else (0 < "x")`: `false` on 0, an error on any
+    /// other element. Since 0 sorts before 1, a set {0, 1} visits the `false`
+    /// element first, which is what the no-short-circuit tests need.
+    fn false_on_zero_else_error() -> PredExpr {
+        pb().ite(
+            pb().binary_app(BinaryOp::Eq, pb().item(), pb().val(0)).unwrap(),
+            pb().val(false),
+            pb().binary_app(BinaryOp::Less, pb().val(0), pb().val("x")).unwrap(),
+        )
+    }
+
+    fn ints(is: &[i64]) -> Expr {
+        Expr::set(is.iter().map(|i| Expr::val(*i)))
+    }
+
+    fn eval(e: &Expr) -> Result<Value> {
+        let entities = basic_entities();
+        let eval = Evaluator::new(basic_request(), &entities, Extensions::none());
+        eval.interpret_inline_policy(e)
+    }
+
+    fn dept_rec(dept: &str) -> Expr {
+        Expr::record([("dept".into(), Expr::val(dept))]).unwrap()
+    }
+
+    fn dept_is_eng() -> PredExpr {
+        pb().binary_app(
+            BinaryOp::Eq,
+            pb().get_attr(pb().item(), "dept".into()),
+            pb().val("eng"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn all_true() {
+        assert_eq!(eval(&Expr::all(ints(&[1, 2, 3]), it_pos())).unwrap(), Value::from(true));
+    }
+
+    #[test]
+    fn all_false() {
+        assert_eq!(eval(&Expr::all(ints(&[1, 2, 3]), it_gt1())).unwrap(), Value::from(false));
+    }
+
+    #[test]
+    fn empty_set_is_true() {
+        assert_eq!(eval(&Expr::all(ints(&[]), it_gt1())).unwrap(), Value::from(true));
+    }
+
+    #[test]
+    fn non_set_receiver_is_type_error() {
+        assert_matches!(
+            eval(&Expr::all(Expr::val(1), it_pos())),
+            Err(EvaluationError::TypeError(_))
+        );
+    }
+
+    #[test]
+    fn receiver_error_propagates() {
+        assert_matches!(
+            eval(&Expr::all(Expr::get_attr(Expr::val(1), "x".into()), it_pos())),
+            Err(EvaluationError::TypeError(_))
+        );
+    }
+
+    #[test]
+    fn erroring_element_is_quantifier_error() {
+        let s = Expr::set([Expr::val(1), Expr::val("a")]);
+        assert_matches!(
+            eval(&Expr::all(s, it_pos())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn false_then_error_is_quantifier_error() {
+        // req 2.8: the `false` on 0 must not short-circuit past the error on 1
+        assert_matches!(
+            eval(&Expr::all(ints(&[0, 1]), false_on_zero_else_error())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn reversed_insertion_order_same_result() {
+        assert_matches!(
+            eval(&Expr::all(ints(&[1, 0]), false_on_zero_else_error())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn non_bool_predicate_is_quantifier_error() {
+        assert_matches!(
+            eval(&Expr::all(ints(&[1]), pb().item())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn records_all_match() {
+        let s = Expr::set([dept_rec("eng")]);
+        assert_eq!(eval(&Expr::all(s, dept_is_eng())).unwrap(), Value::from(true));
+    }
+
+    #[test]
+    fn records_one_differs() {
+        let s = Expr::set([dept_rec("eng"), dept_rec("ops")]);
+        assert_eq!(eval(&Expr::all(s, dept_is_eng())).unwrap(), Value::from(false));
+    }
+
+    #[test]
+    fn records_missing_attr_is_quantifier_error() {
+        let s = Expr::set([Expr::record([("team".into(), Expr::val("eng"))]).unwrap()]);
+        assert_matches!(
+            eval(&Expr::all(s, dept_is_eng())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn predicate_uses_principal() {
+        let p = pb()
+            .binary_app(BinaryOp::Eq, pb().var(Var::Principal), pb().var(Var::Principal))
+            .unwrap();
+        assert_eq!(eval(&Expr::all(ints(&[1]), p)).unwrap(), Value::from(true));
+    }
+
+    #[test]
+    fn any_true() {
+        assert_eq!(eval(&Expr::any(ints(&[1, 2, 3]), it_eq2())).unwrap(), Value::from(true));
+    }
+
+    #[test]
+    fn any_false() {
+        assert_eq!(eval(&Expr::any(ints(&[1, 3]), it_eq2())).unwrap(), Value::from(false));
+    }
+
+    #[test]
+    fn any_empty_is_false() {
+        assert_eq!(eval(&Expr::any(ints(&[]), it_eq2())).unwrap(), Value::from(false));
+    }
+
+    #[test]
+    fn any_true_then_error_is_quantifier_error() {
+        // `any` must not short-circuit on a `true` element either (req 2.8)
+        let s = Expr::set([Expr::val(1), Expr::val("a")]);
+        assert_matches!(
+            eval(&Expr::any(s, it_pos())),
+            Err(EvaluationError::QuantifierError(_))
+        );
+    }
+
+    #[test]
+    fn residual_receiver_stays_residual() {
+        let entities = basic_entities();
+        let eval = Evaluator::new(basic_request(), &entities, Extensions::none());
+        let e = Expr::all(Expr::unknown(Unknown::new_untyped("s")), it_pos());
+        assert_matches!(eval.partial_eval_expr(&e), Ok(Either::Right(r)) => {
+            assert_matches!(r.expr_kind(), ExprKind::All { .. });
+        });
     }
 }
