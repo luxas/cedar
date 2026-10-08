@@ -578,53 +578,191 @@ impl<T: Clone> PredExpr<T> {
     }
 }
 
+impl<T> PredExpr<T> {
+    /// Iterate over this predicate and all of its sub-predicates (pre-order).
+    pub fn subexpressions(&self) -> impl Iterator<Item = &PredExpr<T>> {
+        let mut stack = vec![self];
+        std::iter::from_fn(move || {
+            let next = stack.pop()?;
+            use PredExprKind::*;
+            match next.expr_kind() {
+                Item | Lit(_) | Var(_) => {}
+                If {
+                    test_expr,
+                    then_expr,
+                    else_expr,
+                } => stack.extend([test_expr.as_ref(), then_expr.as_ref(), else_expr.as_ref()]),
+                And { left, right } | Or { left, right } => {
+                    stack.extend([left.as_ref(), right.as_ref()])
+                }
+                UnaryApp { arg, .. } => stack.push(arg),
+                BinaryApp { arg1, arg2, .. } => stack.extend([arg1.as_ref(), arg2.as_ref()]),
+                ExtensionFunctionApp { args, .. } => stack.extend(args.iter()),
+                GetAttr { expr, .. }
+                | HasAttr { expr, .. }
+                | ExtHasAttr { expr, .. }
+                | Like { expr, .. }
+                | Is { expr, .. } => stack.push(expr),
+                Record(map) => stack.extend(map.values()),
+            }
+            Some(next)
+        })
+    }
+}
+
 impl PredExpr {
     /// Instantiate this predicate for one set element: every `it`
     /// ([`PredExprKind::Item`]) becomes the element, embedded as an [`Expr`]
-    /// via `From<Value> for Expr`, and every other node maps to its `ExprKind`
-    /// counterpart. Evaluating the result is evaluating the predicate with
-    /// `it` bound to `elem`.
+    /// via `From<Value> for Expr`. Evaluating the result is evaluating the
+    /// predicate with `it` bound to `elem`.
     pub fn instantiate(&self, elem: &crate::ast::Value) -> crate::ast::Expr {
-        use crate::ast::Expr;
+        self.instantiate_with(&crate::ast::Expr::from(elem.clone()))
+    }
+}
+
+impl<T: Clone + Default> PredExpr<T> {
+    /// Replace every `it` ([`PredExprKind::Item`]) with `item` and map every
+    /// other node to its `ExprKind` counterpart, keeping source locations and
+    /// node data.
+    pub fn instantiate_with(&self, item: &crate::ast::Expr<T>) -> crate::ast::Expr<T> {
+        use crate::ast::{Expr, ExprBuilder};
+        use crate::expr_builder::ExprBuilder as _;
         use PredExprKind::*;
+        let b = || {
+            ExprBuilder::<T>::with_data(self.data.clone()).with_maybe_source_loc(self.source_loc())
+        };
         match self.expr_kind() {
-            Item => Expr::from(elem.clone()),
-            Lit(l) => Expr::val(l.clone()),
-            Var(v) => Expr::var(*v),
+            Item => item.clone(),
+            Lit(l) => b().val(l.clone()),
+            Var(v) => b().var(*v),
             If {
                 test_expr,
                 then_expr,
                 else_expr,
-            } => Expr::ite(
-                test_expr.instantiate(elem),
-                then_expr.instantiate(elem),
-                else_expr.instantiate(elem),
+            } => b().ite(
+                test_expr.instantiate_with(item),
+                then_expr.instantiate_with(item),
+                else_expr.instantiate_with(item),
             ),
-            And { left, right } => Expr::and(left.instantiate(elem), right.instantiate(elem)),
-            Or { left, right } => Expr::or(left.instantiate(elem), right.instantiate(elem)),
-            UnaryApp { op, arg } => Expr::unary_app(*op, arg.instantiate(elem)),
+            And { left, right } => b().and(left.instantiate_with(item), right.instantiate_with(item)),
+            Or { left, right } => b().or(left.instantiate_with(item), right.instantiate_with(item)),
+            UnaryApp { op, arg } => b().unary_app(*op, arg.instantiate_with(item)),
             BinaryApp { op, arg1, arg2 } => {
-                Expr::binary_app(*op, arg1.instantiate(elem), arg2.instantiate(elem))
+                b().binary_app(*op, arg1.instantiate_with(item), arg2.instantiate_with(item))
             }
-            ExtensionFunctionApp { fn_name, args } => Expr::call_extension_fn(
-                fn_name.clone(),
-                args.iter().map(|a| a.instantiate(elem)).collect(),
-            ),
-            GetAttr { expr, attr } => Expr::get_attr(expr.instantiate(elem), attr.clone()),
-            HasAttr { expr, attr } => Expr::has_attr(expr.instantiate(elem), attr.clone()),
+            ExtensionFunctionApp { fn_name, args } => {
+                let args: Vec<Expr<T>> = args.iter().map(|a| a.instantiate_with(item)).collect();
+                match b().call_extension_fn(fn_name.clone(), args) {
+                    Ok(e) => e,
+                    Err(never) => match never {},
+                }
+            }
+            GetAttr { expr, attr } => b().get_attr(expr.instantiate_with(item), attr.clone()),
+            HasAttr { expr, attr } => b().has_attr(expr.instantiate_with(item), attr.clone()),
             ExtHasAttr { expr, attrs } => {
-                Expr::extended_has_attr(expr.instantiate(elem), attrs.clone())
+                b().extended_has_attr(expr.instantiate_with(item), attrs.clone())
             }
-            Like { expr, pattern } => Expr::like(expr.instantiate(elem), pattern.clone()),
+            Like { expr, pattern } => b().like(expr.instantiate_with(item), pattern.clone()),
             Is { expr, entity_type } => {
-                Expr::is_entity_type(expr.instantiate(elem), entity_type.clone())
+                b().is_entity_type(expr.instantiate_with(item), entity_type.clone())
             }
             #[expect(
                 clippy::expect_used,
                 reason = "the keys come from a BTreeMap, so there are no duplicates"
             )]
-            Record(map) => Expr::record(map.iter().map(|(k, v)| (k.clone(), v.instantiate(elem))))
+            Record(map) => b()
+                .record(map.iter().map(|(k, v)| (k.clone(), v.instantiate_with(item))))
                 .expect("the keys come from a BTreeMap, so there are no duplicates"),
+        }
+    }
+
+    /// Inverse of [`Self::instantiate_with`]: rebuild a predicate from an
+    /// instantiated expression, turning every sub-expression for which
+    /// `is_item` holds back into `it`. Returns `None` if the expression has a
+    /// node with no predicate counterpart (a set, slot, other unknown, or a
+    /// nested quantifier).
+    pub fn from_instantiated(
+        e: &crate::ast::Expr<T>,
+        is_item: &impl Fn(&crate::ast::Expr<T>) -> bool,
+    ) -> Option<Self> {
+        use crate::ast::ExprKind as E;
+        use PredExprKind::*;
+        if is_item(e) {
+            return Some(Self::new(Item, e.source_loc().cloned(), e.data().clone()));
+        }
+        let rec = |x: &crate::ast::Expr<T>| Self::from_instantiated(x, is_item).map(Arc::new);
+        let kind = match e.expr_kind() {
+            E::Lit(l) => Lit(l.clone()),
+            E::Var(v) => Var(*v),
+            E::If {
+                test_expr,
+                then_expr,
+                else_expr,
+            } => If {
+                test_expr: rec(test_expr)?,
+                then_expr: rec(then_expr)?,
+                else_expr: rec(else_expr)?,
+            },
+            E::And { left, right } => And {
+                left: rec(left)?,
+                right: rec(right)?,
+            },
+            E::Or { left, right } => Or {
+                left: rec(left)?,
+                right: rec(right)?,
+            },
+            E::UnaryApp { op, arg } => UnaryApp {
+                op: *op,
+                arg: rec(arg)?,
+            },
+            E::BinaryApp { op, arg1, arg2 } => BinaryApp {
+                op: *op,
+                arg1: rec(arg1)?,
+                arg2: rec(arg2)?,
+            },
+            E::ExtensionFunctionApp { fn_name, args } => ExtensionFunctionApp {
+                fn_name: fn_name.clone(),
+                args: Arc::new(
+                    args.iter()
+                        .map(|a| Self::from_instantiated(a, is_item))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+            },
+            E::GetAttr { expr, attr } => GetAttr {
+                expr: rec(expr)?,
+                attr: attr.clone(),
+            },
+            E::HasAttr { expr, attr } => HasAttr {
+                expr: rec(expr)?,
+                attr: attr.clone(),
+            },
+            E::ExtHasAttr { expr, attrs } => ExtHasAttr {
+                expr: rec(expr)?,
+                attrs: attrs.clone(),
+            },
+            E::Like { expr, pattern } => Like {
+                expr: rec(expr)?,
+                pattern: pattern.clone(),
+            },
+            E::Is { expr, entity_type } => Is {
+                expr: rec(expr)?,
+                entity_type: entity_type.clone(),
+            },
+            E::Record(map) => Record(Arc::new(
+                map.iter()
+                    .map(|(k, v)| Some((k.clone(), Self::from_instantiated(v, is_item)?)))
+                    .collect::<Option<BTreeMap<_, _>>>()?,
+            )),
+            _ => return None,
+        };
+        Some(Self::new(kind, e.source_loc().cloned(), e.data().clone()))
+    }
+
+    fn new(expr_kind: PredExprKind<T>, source_loc: Option<Loc>, data: T) -> Self {
+        Self {
+            expr_kind,
+            source_loc,
+            data,
         }
     }
 }

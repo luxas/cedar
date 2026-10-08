@@ -165,6 +165,8 @@ impl<'a> Typechecker<'a> {
             mode: self.mode,
             policy_id,
             request_env,
+            #[cfg(feature = "anyall")]
+            it_type: None,
         };
         let empty_prior_capability = CapabilitySet::new();
         let ans = single_env_typechecker.expect_type(
@@ -329,7 +331,16 @@ struct SingleEnvTypechecker<'a> {
     policy_id: &'a PolicyID,
     /// The single env which we're performing typechecking for
     request_env: &'a RequestEnv<'a>,
+    /// Type of the element keyword `it`, set only while typechecking the
+    /// predicate of a `.all`/`.any` set quantifier
+    #[cfg(feature = "anyall")]
+    it_type: Option<Type>,
 }
+
+/// Name of the unknown that stands for `it` when a set-quantifier predicate is
+/// instantiated for typechecking. It cannot be written in policy text.
+#[cfg(feature = "anyall")]
+pub(crate) const IT_PLACEHOLDER: &str = "__cedar::anyall::it";
 
 impl<'a> SingleEnvTypechecker<'a> {
     /// This method handles the majority of the work. Given an expression, and
@@ -387,6 +398,14 @@ impl<'a> SingleEnvTypechecker<'a> {
                     .with_same_source_loc(e)
                     .var(Var::Context),
             ),
+            #[cfg(feature = "anyall")]
+            ExprKind::Unknown(u) if u.name == IT_PLACEHOLDER && self.it_type.is_some() => {
+                TypecheckAnswer::success(
+                    ExprBuilder::with_data(self.it_type.clone())
+                        .with_same_source_loc(e)
+                        .unknown(u.clone()),
+                )
+            }
             ExprKind::Unknown(u) => {
                 TypecheckAnswer::fail(ExprBuilder::with_data(None).unknown(u.clone()))
             }
@@ -1250,17 +1269,70 @@ impl<'a> SingleEnvTypechecker<'a> {
             }
             #[cfg(feature = "anyall")]
             ExprKind::All { expr: recv, pred } => {
-                // Phase 3 adds the real `.all`/`.any` type rule (requirements
-                // §6: `E : Set<τ>`, `P : Bool` under `it : τ` => `Bool`). In
-                // Phase 1 the node has no type rule yet and nothing parses one,
-                // so it conservatively fails to typecheck (never silently
-                // validates). The node is rebuilt with `None` type data.
-                let ans_recv = self.typecheck(prior_capability, recv, type_errors);
+                // Requirements 6.1-6.3: `E : Set<T>` and `P : Bool` with
+                // `it : T` give `E.all(P) : Bool`. `P` is typechecked by
+                // instantiating `it` with a placeholder that a nested
+                // typechecker types as `T`, so every existing typing rule
+                // applies inside the predicate unchanged. An unknown element
+                // type (e.g. an empty set literal) types `it` as `Never`.
+                // Requirement 1.5: no sub-expression of `P` may have a set type.
+                let ans_recv = self.expect_type(
+                    prior_capability,
+                    recv,
+                    Type::any_set(),
+                    type_errors,
+                    |_| None,
+                );
                 ans_recv.then_typecheck(|annot_recv, _| {
-                    let annot = ExprBuilder::with_data(None)
+                    let elem_ty = match annot_recv.data() {
+                        Some(Type::Set {
+                            element_type: Some(ty),
+                        }) => ty.as_ref().clone(),
+                        _ => Type::Never,
+                    };
+                    let item = Expr::unknown(crate::ast::Unknown::new_untyped(IT_PLACEHOLDER));
+                    let inst = pred.instantiate_with(&item);
+                    let inner = SingleEnvTypechecker {
+                        it_type: Some(elem_ty),
+                        ..*self
+                    };
+                    let pred_ans = inner.expect_type(
+                        prior_capability,
+                        &inst,
+                        Type::primitive_boolean(),
+                        type_errors,
+                        |_| None,
+                    );
+                    let pred_ok = pred_ans.typechecked();
+                    let typed_inst = pred_ans.into_typed_expr();
+                    let has_set_term = typed_inst.as_ref().is_some_and(|t| {
+                        t.subexpressions()
+                            .any(|s| matches!(s.data(), Some(Type::Set { .. })))
+                    });
+                    // Keep the typed predicate on the annotated node (used by
+                    // level validation); fall back to an untyped copy.
+                    let typed_pred = typed_inst
+                        .as_ref()
+                        .and_then(|t| {
+                            crate::ast::PredExpr::from_instantiated(t, &|x| {
+                                matches!(x.expr_kind(), ExprKind::Unknown(u) if u.name == IT_PLACEHOLDER)
+                            })
+                        })
+                        .unwrap_or_else(|| pred.as_ref().with_default_data());
+                    if has_set_term {
+                        type_errors.push(ValidationError::set_term_in_quantifier(
+                            e.source_loc().cloned(),
+                            self.policy_id.clone(),
+                        ));
+                    }
+                    let annot = ExprBuilder::with_data(Some(Type::primitive_boolean()))
                         .with_same_source_loc(e)
-                        .all(annot_recv, pred.as_ref().with_default_data());
-                    TypecheckAnswer::fail(annot)
+                        .all(annot_recv, typed_pred);
+                    if pred_ok && !has_set_term {
+                        TypecheckAnswer::success(annot)
+                    } else {
+                        TypecheckAnswer::fail(annot)
+                    }
                 })
             }
             #[cfg(feature = "tolerant-ast")]
