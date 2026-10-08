@@ -476,6 +476,12 @@ fn is_restricted(expr: &Expr) -> Result<(), RestrictedExpressionError> {
             expr: expr.clone(),
         }
         .into()),
+        #[cfg(feature = "anyall")]
+        ExprKind::All { .. } => Err(restricted_expr_errors::InvalidRestrictedExpressionError {
+            feature: "`.all`/`.any` set operators".into(),
+            expr: expr.clone(),
+        }
+        .into()),
         ExprKind::Slot(_) => Err(restricted_expr_errors::InvalidRestrictedExpressionError {
             feature: "template slots".into(),
             expr: expr.clone(),

@@ -176,6 +176,18 @@ pub enum ExprKind<T = ()> {
         /// Type of error that led to the failure
         error_kind: AstExprErrorKind,
     },
+    #[cfg(feature = "anyall")]
+    /// Universal set quantifier `expr.all(pred)` — true iff `pred` holds for
+    /// every element of the set `expr`. The surface `.any` has no node of its
+    /// own: `expr.any(pred)` lowers to `!expr.all(!pred)` at the builder layer,
+    /// exactly as `>`/`>=` lower to `!(<=)`/`!(<)`. `pred` is the restricted,
+    /// set-free [`PredExpr`] over the element keyword `it`.
+    All {
+        /// Receiver; must evaluate to a Set.
+        expr: Arc<Expr<T>>,
+        /// Set-free, non-nested predicate over the current element `it`.
+        pred: Arc<PredExpr<T>>,
+    },
 }
 
 impl<T> ExprKind<T> {
@@ -201,6 +213,8 @@ impl<T> ExprKind<T> {
             ExprKind::Is { .. } => 16,
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => 17,
+            #[cfg(feature = "anyall")]
+            ExprKind::All { .. } => 18,
         }
     }
 }
@@ -434,6 +448,8 @@ impl<T> Expr<T> {
             ExprKind::ExtHasAttr { .. } => Some(Type::Bool),
             ExprKind::Like { .. } => Some(Type::Bool),
             ExprKind::Is { .. } => Some(Type::Bool),
+            #[cfg(feature = "anyall")]
+            ExprKind::All { .. } => Some(Type::Bool),
             ExprKind::Set(_) => Some(Type::Set),
             ExprKind::Record(_) => Some(Type::Record),
             #[cfg(feature = "tolerant-ast")]
@@ -506,6 +522,14 @@ impl<T> Expr<T> {
                 Arc::unwrap_or_clone(expr).try_into_expr::<B>()?,
                 entity_type,
             )),
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, pred } => {
+                let pred = builder.pred_from_ast(pred.as_ref());
+                Ok(builder.all(
+                    Arc::unwrap_or_clone(expr).try_into_expr::<B>()?,
+                    pred,
+                ))
+            }
             ExprKind::Set(set) => Ok(builder.set(
                 Arc::unwrap_or_clone(set)
                     .into_iter()
@@ -772,6 +796,21 @@ impl Expr {
         ExprBuilder::new().is_entity_type(expr, entity_type)
     }
 
+    /// Create an `all` expression: `expr.all(pred)` — `expr` evaluates to a Set
+    /// and `pred` is a set-free predicate over the element keyword `it`.
+    #[cfg(feature = "anyall")]
+    pub fn all(expr: Expr, pred: PredExpr) -> Self {
+        use crate::expr_builder::ExprBuilder as _;
+        ExprBuilder::new().all(expr, pred)
+    }
+
+    /// Create an `any` expression: `expr.any(pred)`, lowered losslessly to
+    /// `!expr.all(!pred)` (cf. `e1 >= e2 := !(e1 < e2)`).
+    #[cfg(feature = "anyall")]
+    pub fn any(expr: Expr, pred: PredExpr) -> Self {
+        Expr::not(Expr::all(expr, pred.negate()))
+    }
+
     /// Check if an expression contains any symbolic unknowns
     pub fn contains_unknown(&self) -> bool {
         self.subexpressions()
@@ -901,6 +940,13 @@ impl Expr {
             ExprKind::Is { expr, entity_type } => Ok(Expr::is_entity_type(
                 expr.substitute_general::<T>(definitions)?,
                 entity_type.clone(),
+            )),
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, pred } => Ok(Expr::all(
+                expr.substitute_general::<T>(definitions)?,
+                // A predicate contains no `Unknown`, so substitution through it
+                // is a structural clone (see `PredExpr::substitute_general`).
+                pred.substitute_general(&|_: &SmolStr| None),
             )),
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => Ok(self.clone()),
@@ -1097,6 +1143,9 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprBuilder<T> {
     type Expr = Expr<T>;
 
     type Data = T;
+
+    #[cfg(feature = "anyall")]
+    type Pred = PredExpr<T>;
 
     type BuildError = Infallible;
 
@@ -1415,6 +1464,25 @@ impl<T: Default + Clone> expr_builder::ExprBuilder for ExprBuilder<T> {
         self.with_expr_kind(ExprKind::Is { expr, entity_type })
     }
 
+    #[cfg(feature = "anyall")]
+    fn all(self, expr: Expr<T>, pred: PredExpr<T>) -> Expr<T> {
+        self.with_expr_kind(ExprKind::All {
+            expr: Arc::new(expr),
+            pred: Arc::new(pred),
+        })
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_ast<U>(&self, pred: &PredExpr<U>) -> PredExpr<T>
+    where
+        U: Clone,
+    {
+        // Rebuild the predicate carrying this builder's node-data type `T`,
+        // discarding the source data `U` — mirrors how the other arms rebuild
+        // with the target builder's data rather than the source's.
+        pred.with_default_data()
+    }
+
     /// Create an extended has expression directly in the AST without desugaring.
     fn extended_has_attr_arc(self, expr: Arc<Expr<T>>, attrs: NonEmpty<SmolStr>) -> Expr<T> {
         // If there's only one attribute, create a simple HasAttr node
@@ -1685,6 +1753,14 @@ impl<T> Expr<T> {
                     entity_type: entity_type1,
                 },
             ) => entity_type == entity_type1 && expr.eq_shape(expr1),
+            #[cfg(feature = "anyall")]
+            (
+                All { expr, pred },
+                All {
+                    expr: expr1,
+                    pred: pred1,
+                },
+            ) => expr.eq_shape(expr1) && pred.eq_shape(pred1),
             _ => false,
         }
     }
@@ -1767,6 +1843,11 @@ impl<T> Expr<T> {
             ExprKind::Is { expr, entity_type } => {
                 expr.hash_shape(state);
                 entity_type.hash(state);
+            }
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, pred } => {
+                expr.hash_shape(state);
+                pred.hash_shape(state);
             }
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { error_kind, .. } => error_kind.hash(state),
@@ -1915,6 +1996,14 @@ impl<T> Expr<T> {
             ) => entity_type
                 .cmp(entity_type1)
                 .then_with(|| expr.cmp_shape(expr1)),
+            #[cfg(feature = "anyall")]
+            (
+                All { expr, pred },
+                All {
+                    expr: expr1,
+                    pred: pred1,
+                },
+            ) => expr.cmp_shape(expr1).then_with(|| pred.cmp_shape(pred1)),
             #[cfg(feature = "tolerant-ast")]
             (
                 Error { error_kind },
@@ -2612,5 +2701,139 @@ mod validate_test {
                 .to_string()
                 .starts_with("invalid expression: extended has attribute"))
         }
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+mod anyall_test {
+    use super::*;
+    use crate::ast::pred::PredExprBuilder;
+    use std::collections::hash_map::DefaultHasher;
+
+    /// `pred`: `it == 1`
+    fn pred_it_eq_1() -> PredExpr {
+        PredExprBuilder::new()
+            .binary_app(
+                BinaryOp::Eq,
+                PredExprBuilder::new().item(),
+                PredExprBuilder::new().val(1i64),
+            )
+            .unwrap()
+    }
+
+    /// receiver: `principal.roles`
+    fn recv_roles() -> Expr {
+        Expr::get_attr(Expr::var(Var::Principal), "roles".into())
+    }
+
+    fn hash_of(e: &Expr) -> u64 {
+        let mut h = DefaultHasher::new();
+        e.hash_shape(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn all_builds_an_all_node() {
+        let e = Expr::all(recv_roles(), pred_it_eq_1());
+        match e.expr_kind() {
+            ExprKind::All { expr, pred } => {
+                assert!(expr.eq_shape(&recv_roles()));
+                assert!(pred.eq_shape(&pred_it_eq_1()));
+            }
+            other => panic!("expected All, got {other:?}"),
+        }
+        // `.all` is a Bool
+        assert_eq!(
+            e.try_type_of(&crate::extensions::Extensions::none()),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn any_lowers_to_not_all_not() {
+        // `expr.any(p)` must be exactly `!expr.all(!p)` (lossless lowering,
+        // cf. `e1 >= e2 := !(e1 < e2)`).
+        let any = Expr::any(recv_roles(), pred_it_eq_1());
+        let expected = Expr::not(Expr::all(recv_roles(), pred_it_eq_1().negate()));
+        assert!(
+            any.eq_shape(&expected),
+            "any did not lower to !all(!p):\n  got {any:?}\n  want {expected:?}"
+        );
+        // Structurally: Not(All(.., Not(it==1)))
+        match any.expr_kind() {
+            ExprKind::UnaryApp {
+                op: UnaryOp::Not,
+                arg,
+            } => match arg.expr_kind() {
+                ExprKind::All { pred, .. } => match pred.expr_kind() {
+                    crate::ast::PredExprKind::UnaryApp {
+                        op: UnaryOp::Not, ..
+                    } => {}
+                    other => panic!("expected negated predicate, got {other:?}"),
+                },
+                other => panic!("expected All under Not, got {other:?}"),
+            },
+            other => panic!("expected Not at top of `any`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_hash_cmp_shape_on_all() {
+        let a = Expr::all(recv_roles(), pred_it_eq_1());
+        let b = Expr::all(recv_roles(), pred_it_eq_1());
+        // different predicate (it == 2)
+        let c = Expr::all(
+            recv_roles(),
+            PredExprBuilder::new()
+                .binary_app(
+                    BinaryOp::Eq,
+                    PredExprBuilder::new().item(),
+                    PredExprBuilder::new().val(2i64),
+                )
+                .unwrap(),
+        );
+        assert!(a.eq_shape(&b));
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert!(!a.eq_shape(&c));
+        assert_eq!(a.cmp_shape(&b), std::cmp::Ordering::Equal);
+        assert_ne!(a.cmp_shape(&c), std::cmp::Ordering::Equal);
+        // antisymmetry
+        assert_eq!(c.cmp_shape(&a), a.cmp_shape(&c).reverse());
+        // an All differs in shape from its receiver (different variant)
+        assert!(!a.eq_shape(&recv_roles()));
+    }
+
+    #[test]
+    fn try_into_expr_ast_roundtrip_preserves_all() {
+        // AST -> AST conversion must reconstruct an equal All node (exercises
+        // the generic `try_into_expr` All arm + `pred_from_ast`).
+        let a = Expr::all(recv_roles(), pred_it_eq_1());
+        let back: Expr = a.clone().into_expr::<ExprBuilder<()>>();
+        assert!(a.eq_shape(&back), "roundtrip changed shape:\n{a:?}\n{back:?}");
+    }
+
+    #[test]
+    fn subexpressions_include_receiver_not_predicate() {
+        // The receiver is an `Expr` subexpression; the predicate is a distinct
+        // type and must not appear in the `Expr` subexpression walk.
+        let a = Expr::all(recv_roles(), pred_it_eq_1());
+        let subs: Vec<&Expr> = a.subexpressions().collect();
+        // includes the All node itself and the receiver chain (get_attr, var)
+        assert!(subs.iter().any(|e| matches!(e.expr_kind(), ExprKind::All { .. })));
+        assert!(subs
+            .iter()
+            .any(|e| matches!(e.expr_kind(), ExprKind::GetAttr { .. })));
+        assert!(subs
+            .iter()
+            .any(|e| matches!(e.expr_kind(), ExprKind::Var(Var::Principal))));
+    }
+
+    #[test]
+    fn substitute_passes_through_all() {
+        // No unknowns here; substitute_general must structurally preserve the
+        // All node (empty mapping).
+        let a = Expr::all(recv_roles(), pred_it_eq_1());
+        let subbed = a.substitute(&std::collections::HashMap::new());
+        assert!(a.eq_shape(&subbed));
     }
 }

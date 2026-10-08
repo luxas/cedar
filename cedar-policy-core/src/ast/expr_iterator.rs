@@ -83,6 +83,13 @@ impl<'a, T> Iterator for ExprIterator<'a, T> {
             ExprKind::Record(map) => {
                 self.expression_stack.extend(map.values());
             }
+            // Only the receiver `expr` is an `Expr<T>`; the predicate is a
+            // `PredExpr<T>` (a distinct type) and is not part of this iterator's
+            // `Expr` subexpression walk.
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, pred: _ } => {
+                self.expression_stack.push(expr);
+            }
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => (),
         }

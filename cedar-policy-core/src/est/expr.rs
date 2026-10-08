@@ -470,6 +470,8 @@ impl ExprBuilder for Builder {
     type Expr = Expr;
     type BuildError = Infallible;
     type Data = ();
+    #[cfg(feature = "anyall")]
+    type Pred = crate::ast::PredExpr;
     #[cfg(feature = "tolerant-ast")]
     type ErrorType = Infallible;
 
@@ -487,6 +489,23 @@ impl ExprBuilder for Builder {
 
     fn data(&self) -> &Self::Data {
         &()
+    }
+
+    #[cfg(feature = "anyall")]
+    #[expect(
+        clippy::unreachable,
+        reason = "EST `all` form lands in Phase 4; nothing constructs an EST `All` to build in Phase 1, so this is dead code"
+    )]
+    fn all(self, _expr: Self::Expr, _pred: Self::Pred) -> Self::Expr {
+        unreachable!("EST `all` form is introduced in Phase 4 (surface syntax + roundtrip)")
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred {
+        // Harmless: lift to the AST predicate (the EST `Pred` type). Only ever
+        // reached from `Expr::try_into_expr`, which in Phase 1 never converts an
+        // AST `All` into EST, but returning a value avoids any panic risk.
+        pred.with_default_data()
     }
 
     /// literal

@@ -75,6 +75,8 @@ pub trait ExprVisitor {
             ExprKind::ExtHasAttr { expr, attrs } => self.visit_extended_has_attr(expr, attrs, loc),
             ExprKind::Like { expr, pattern } => self.visit_like(expr, pattern, loc),
             ExprKind::Is { expr, entity_type } => self.visit_is(expr, entity_type, loc),
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, pred } => self.visit_all(expr, pred, loc),
             ExprKind::Set(elements) => self.visit_set(elements, loc),
             ExprKind::Record(fields) => self.visit_record(fields, loc),
             #[cfg(feature = "tolerant-ast")]
@@ -238,6 +240,22 @@ pub trait ExprVisitor {
         &mut self,
         expr: &Arc<Expr>,
         _entity_type: &EntityType,
+        _loc: Option<&Loc>,
+    ) -> Option<Self::Output> {
+        self.visit_expr(expr)
+    }
+
+    /// Visits an `all` expression (`expr.all(pred)`).
+    ///
+    /// Recursively visits the receiver `expr`. The predicate `pred` is a
+    /// [`crate::ast::PredExpr`] (a distinct type from [`Expr`]) and is not
+    /// walked by this `Expr` visitor; an implementor that needs the predicate
+    /// can override this method.
+    #[cfg(feature = "anyall")]
+    fn visit_all(
+        &mut self,
+        expr: &Arc<Expr>,
+        _pred: &Arc<crate::ast::PredExpr>,
         _loc: Option<&Loc>,
     ) -> Option<Self::Output> {
         self.visit_expr(expr)

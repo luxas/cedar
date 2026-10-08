@@ -380,6 +380,14 @@ impl LevelChecker<'_> {
             ExprKind::Is { expr, .. } => {
                 self.check_expr_level(expr, env);
             }
+            // Phase 1: recurse into the receiver only. Full level validation of
+            // the predicate (over `it`) lands with `.all`/`.any` validation in
+            // Phase 3; the predicate is a `PredExpr`, which this `Expr` walk
+            // does not descend into.
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr, .. } => {
+                self.check_expr_level(expr, env);
+            }
             ExprKind::Set(exprs) => {
                 for e in exprs.iter() {
                     self.check_expr_level(e, env);
