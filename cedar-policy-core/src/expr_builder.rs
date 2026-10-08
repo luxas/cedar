@@ -53,6 +53,12 @@ pub trait ExprBuilder: Clone {
     /// Type for errors returned by the fallible methods of the builder impl.
     type BuildError: Debug;
 
+    /// Representation of a set-free predicate (over the element keyword `it`)
+    /// that this builder attaches to an `all` node. For the AST builder this
+    /// is [`crate::ast::PredExpr`]; other builders may use their own form.
+    #[cfg(feature = "anyall")]
+    type Pred;
+
     /// Type for what error we return if we cannot construct an error node
     ///
     ///  By default we fail on errors and this should be a ParseErrors
@@ -252,6 +258,26 @@ pub trait ExprBuilder: Clone {
 
     /// Create an 'is' expression from an `Arc<Self::Expr>` and `EntityType`.
     fn is_entity_type_arc(self, expr: Arc<Self::Expr>, entity_type: EntityType) -> Self::Expr;
+
+    /// Create an `all` expression: `expr.all(pred)`, where `expr` evaluates to
+    /// a Set and `pred` is a set-free predicate over the element keyword `it`.
+    /// Evaluates to Bool.
+    #[cfg(feature = "anyall")]
+    fn all(self, expr: Self::Expr, pred: Self::Pred) -> Self::Expr;
+
+    /// Lift an AST [`crate::ast::PredExpr`] into this builder's predicate
+    /// representation ([`Self::Pred`]). Used by
+    /// [`crate::ast::Expr::try_into_expr`] to carry an `All` node's predicate
+    /// across a generic builder `B`. The source node data `U` is discarded,
+    /// mirroring how every other `try_into_expr` arm rebuilds with the
+    /// builder's own [`Self::Data`] rather than the source data.
+    ///
+    /// The AST builder returns an equivalent predicate carrying its own data.
+    /// Builders that have no `all` form yet (EST/PST, until Phase 4) have no
+    /// path that reaches this, because nothing constructs an EST/PST `All` to
+    /// convert into.
+    #[cfg(feature = "anyall")]
+    fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred;
 
     /// Create an `_ is _ in _`  expression
     fn is_in_entity_type(

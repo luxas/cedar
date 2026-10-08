@@ -240,7 +240,7 @@ impl<T> PredExpr<T> {
 
     /// Structural equality ignoring source locations and node data — the
     /// predicate analogue of [`crate::ast::Expr::eq_shape`].
-    pub fn eq_shape(&self, other: &Self) -> bool {
+    pub fn eq_shape<U>(&self, other: &PredExpr<U>) -> bool {
         use PredExprKind::*;
         match (self.expr_kind(), other.expr_kind()) {
             (Item, Item) => true,
@@ -485,6 +485,82 @@ impl<T> PredExpr<T> {
 }
 
 impl<T: Clone> PredExpr<T> {
+    /// Rebuild this predicate with fresh default node data of type `U`,
+    /// discarding the current data `T`. Source locations are preserved.
+    ///
+    /// Used by [`crate::expr_builder::ExprBuilder::pred_from_ast`] so an `All`
+    /// node's predicate can cross a `try_into_expr::<B>` conversion that
+    /// changes the node-data type (every other arm likewise rebuilds with the
+    /// target builder's data).
+    pub fn with_default_data<U: Default + Clone>(&self) -> PredExpr<U> {
+        use PredExprKind::*;
+        let rebuild = |k: PredExprKind<U>| PredExpr {
+            expr_kind: k,
+            source_loc: self.source_loc.clone(),
+            data: U::default(),
+        };
+        match self.expr_kind() {
+            Item => rebuild(Item),
+            Lit(l) => rebuild(Lit(l.clone())),
+            Var(v) => rebuild(Var(*v)),
+            If {
+                test_expr,
+                then_expr,
+                else_expr,
+            } => rebuild(If {
+                test_expr: Arc::new(test_expr.with_default_data()),
+                then_expr: Arc::new(then_expr.with_default_data()),
+                else_expr: Arc::new(else_expr.with_default_data()),
+            }),
+            And { left, right } => rebuild(And {
+                left: Arc::new(left.with_default_data()),
+                right: Arc::new(right.with_default_data()),
+            }),
+            Or { left, right } => rebuild(Or {
+                left: Arc::new(left.with_default_data()),
+                right: Arc::new(right.with_default_data()),
+            }),
+            UnaryApp { op, arg } => rebuild(UnaryApp {
+                op: *op,
+                arg: Arc::new(arg.with_default_data()),
+            }),
+            BinaryApp { op, arg1, arg2 } => rebuild(BinaryApp {
+                op: *op,
+                arg1: Arc::new(arg1.with_default_data()),
+                arg2: Arc::new(arg2.with_default_data()),
+            }),
+            ExtensionFunctionApp { fn_name, args } => rebuild(ExtensionFunctionApp {
+                fn_name: fn_name.clone(),
+                args: Arc::new(args.iter().map(|a| a.with_default_data()).collect()),
+            }),
+            GetAttr { expr, attr } => rebuild(GetAttr {
+                expr: Arc::new(expr.with_default_data()),
+                attr: attr.clone(),
+            }),
+            HasAttr { expr, attr } => rebuild(HasAttr {
+                expr: Arc::new(expr.with_default_data()),
+                attr: attr.clone(),
+            }),
+            ExtHasAttr { expr, attrs } => rebuild(ExtHasAttr {
+                expr: Arc::new(expr.with_default_data()),
+                attrs: attrs.clone(),
+            }),
+            Like { expr, pattern } => rebuild(Like {
+                expr: Arc::new(expr.with_default_data()),
+                pattern: pattern.clone(),
+            }),
+            Is { expr, entity_type } => rebuild(Is {
+                expr: Arc::new(expr.with_default_data()),
+                entity_type: entity_type.clone(),
+            }),
+            Record(m) => rebuild(Record(Arc::new(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.with_default_data()))
+                    .collect(),
+            ))),
+        }
+    }
+
     /// Substitute unknowns by name, recursing into the predicate structure.
     ///
     /// Phase 1 only needs this so [`crate::ast::Expr::substitute_general`] can

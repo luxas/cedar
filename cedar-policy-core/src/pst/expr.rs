@@ -1013,6 +1013,9 @@ impl ExprBuilder for PstBuilder {
     type Data = ();
     type BuildError = PstConstructionError;
 
+    #[cfg(feature = "anyall")]
+    type Pred = crate::ast::PredExpr;
+
     #[cfg(feature = "tolerant-ast")]
     type ErrorType = crate::parser::err::ParseErrors;
 
@@ -1031,6 +1034,22 @@ impl ExprBuilder for PstBuilder {
 
     fn data(&self) -> &Self::Data {
         &()
+    }
+
+    #[cfg(feature = "anyall")]
+    #[expect(
+        clippy::unreachable,
+        reason = "PST `all` form lands in Phase 4; nothing constructs a PST `All` to build in Phase 1, so this is dead code"
+    )]
+    fn all(self, _expr: Self::Expr, _pred: Self::Pred) -> Self::Expr {
+        unreachable!("PST `all` form is introduced in Phase 4 (surface syntax + roundtrip)")
+    }
+
+    #[cfg(feature = "anyall")]
+    fn pred_from_ast<U: Clone>(&self, pred: &crate::ast::PredExpr<U>) -> Self::Pred {
+        // Harmless lift; only reachable from `Expr::try_into_expr`, which never
+        // converts an AST `All` into PST in Phase 1.
+        pred.with_default_data()
     }
 
     fn val(self, lit: impl Into<ast::Literal>) -> Expr {

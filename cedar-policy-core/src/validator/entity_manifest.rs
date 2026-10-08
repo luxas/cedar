@@ -689,6 +689,12 @@ fn entity_manifest_from_expr(
             }
             Ok(result.empty_paths())
         }
+        #[cfg(feature = "anyall")]
+        ExprKind::All { .. } => Err(EntityManifestError::UnsupportedCedarFeature(
+            UnsupportedCedarFeatureError {
+                feature: "entity manifest analysis for `.all`/`.any` is not yet supported".into(),
+            },
+        )),
         #[cfg(feature = "tolerant-ast")]
         ExprKind::Error { .. } => Err(EntityManifestError::UnsupportedCedarFeature(
             UnsupportedCedarFeatureError {

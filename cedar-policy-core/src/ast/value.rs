@@ -363,6 +363,8 @@ impl TryFrom<Expr> for ValueKind {
             }
             ExprKind::Like { .. } => Err(NotValue::NotValue { loc }),
             ExprKind::Is { .. } => Err(NotValue::NotValue { loc }),
+            #[cfg(feature = "anyall")]
+            ExprKind::All { .. } => Err(NotValue::NotValue { loc }),
             ExprKind::Set(members) => members
                 .iter()
                 .map(|e| Value::try_from(e.clone()))

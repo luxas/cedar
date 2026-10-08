@@ -1248,6 +1248,21 @@ impl<'a> SingleEnvTypechecker<'a> {
                     },
                 )
             }
+            #[cfg(feature = "anyall")]
+            ExprKind::All { expr: recv, pred } => {
+                // Phase 3 adds the real `.all`/`.any` type rule (requirements
+                // §6: `E : Set<τ>`, `P : Bool` under `it : τ` => `Bool`). In
+                // Phase 1 the node has no type rule yet and nothing parses one,
+                // so it conservatively fails to typecheck (never silently
+                // validates). The node is rebuilt with `None` type data.
+                let ans_recv = self.typecheck(prior_capability, recv, type_errors);
+                ans_recv.then_typecheck(|annot_recv, _| {
+                    let annot = ExprBuilder::with_data(None)
+                        .with_same_source_loc(e)
+                        .all(annot_recv, pred.as_ref().with_default_data());
+                    TypecheckAnswer::fail(annot)
+                })
+            }
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => TypecheckAnswer::ErrorAstNode,
         }

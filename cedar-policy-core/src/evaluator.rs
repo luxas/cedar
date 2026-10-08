@@ -776,6 +776,14 @@ impl<'e> Evaluator<'e> {
                     }
                 }
             }
+            #[cfg(feature = "anyall")]
+            ExprKind::All { .. } => {
+                // Phase 3 implements `.all`/`.any` evaluation (element binding
+                // + short-circuiting). In Phase 1 the node is construct-only and
+                // no parser produces one, so reaching the evaluator is treated
+                // as a non-value residual rather than a crash.
+                Err(err::EvaluationError::non_value(expr.clone()))
+            }
             #[cfg(feature = "tolerant-ast")]
             ExprKind::Error { .. } => Err(ASTErrorExpr(ASTErrorExprError {
                 source_loc: loc.cloned(),
