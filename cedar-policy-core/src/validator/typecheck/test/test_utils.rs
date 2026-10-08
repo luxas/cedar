@@ -125,6 +125,8 @@ impl Typechecker<'_> {
             mode: self.mode,
             policy_id,
             request_env,
+            #[cfg(feature = "anyall")]
+            it_type: None,
         };
         let mut type_errors = Vec::new();
         let ans = typechecker.typecheck(&CapabilitySet::new(), e, &mut type_errors);

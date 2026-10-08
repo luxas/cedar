@@ -485,6 +485,12 @@ pub enum ValidationError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     InvalidEnumEntity(#[from] validation_errors::InvalidEnumEntity),
+    /// Returned when the predicate of a `.all`/`.any` set quantifier contains a
+    /// set-typed expression
+    #[cfg(feature = "anyall")]
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    SetTermInQuantifier(#[from] validation_errors::SetTermInQuantifier),
 }
 
 impl ValidationError {
@@ -504,6 +510,8 @@ impl ValidationError {
             Self::WrongNumberArguments(e) => e.policy_id(),
             Self::FunctionArgumentValidation(e) => e.policy_id(),
             Self::EmptySetForbidden(e) => e.policy_id(),
+            #[cfg(feature = "anyall")]
+            Self::SetTermInQuantifier(e) => e.policy_id(),
             Self::NonLitExtConstructor(e) => e.policy_id(),
             Self::HierarchyNotRespected(e) => e.policy_id(),
             Self::InternalInvariantViolation(e) => e.policy_id(),
@@ -564,6 +572,10 @@ impl From<cedar_policy_core::validator::ValidationError> for ValidationError {
             }
             cedar_policy_core::validator::ValidationError::EntityDerefLevelViolation(e) => {
                 Self::EntityDerefLevelViolation(e.into())
+            }
+            #[cfg(feature = "anyall")]
+            cedar_policy_core::validator::ValidationError::SetTermInQuantifier(e) => {
+                Self::SetTermInQuantifier(e.into())
             }
         }
     }

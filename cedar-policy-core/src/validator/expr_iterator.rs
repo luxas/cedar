@@ -17,21 +17,47 @@
 use crate::ast::{EntityType, EntityUID, Expr, ExprKind, Literal, Name, Pattern, Template};
 use crate::parser::Loc;
 
+/// Predicates of the `.all`/`.any` set quantifiers among `expr`'s
+/// subexpressions. `subexpressions()` yields only `Expr` nodes, so walks that
+/// must also see predicate leaves chain these in.
+#[cfg(feature = "anyall")]
+fn quantifier_preds(expr: &Expr) -> impl Iterator<Item = &crate::ast::PredExpr> {
+    expr.subexpressions()
+        .filter_map(|e| match e.expr_kind() {
+            ExprKind::All { pred, .. } => Some(pred.as_ref()),
+            _ => None,
+        })
+        .flat_map(|p| p.subexpressions())
+}
+
 /// Returns an iterator over all literal entity uids in the expression.
 pub(super) fn expr_entity_uids(expr: &Expr) -> impl Iterator<Item = &EntityUID> {
-    expr.subexpressions().filter_map(|e| match e.expr_kind() {
+    let uids = expr.subexpressions().filter_map(|e| match e.expr_kind() {
         ExprKind::Lit(Literal::EntityUID(uid)) => Some(uid.as_ref()),
         _ => None,
-    })
+    });
+    #[cfg(feature = "anyall")]
+    let uids = uids.chain(quantifier_preds(expr).filter_map(|p| match p.expr_kind() {
+        crate::ast::PredExprKind::Lit(Literal::EntityUID(uid)) => Some(uid.as_ref()),
+        _ => None,
+    }));
+    uids
 }
 
 /// Returns an iterator over all entity type names in the expression.
 pub(super) fn expr_entity_type_names(expr: &Expr) -> impl Iterator<Item = &EntityType> {
-    expr.subexpressions().filter_map(|e| match e.expr_kind() {
+    let tys = expr.subexpressions().filter_map(|e| match e.expr_kind() {
         ExprKind::Lit(Literal::EntityUID(uid)) => Some(uid.entity_type()),
         ExprKind::Is { entity_type, .. } => Some(entity_type),
         _ => None,
-    })
+    });
+    #[cfg(feature = "anyall")]
+    let tys = tys.chain(quantifier_preds(expr).filter_map(|p| match p.expr_kind() {
+        crate::ast::PredExprKind::Lit(Literal::EntityUID(uid)) => Some(uid.entity_type()),
+        crate::ast::PredExprKind::Is { entity_type, .. } => Some(entity_type),
+        _ => None,
+    }));
+    tys
 }
 
 /// Returns an iterator over all literal entity uids in a policy. This iterates
@@ -96,7 +122,34 @@ pub enum TextKind<'a> {
 
 /// Returns an iterator over all text (strings and identifiers) in the expression.
 pub(super) fn expr_text(e: &'_ Expr) -> impl Iterator<Item = TextKind<'_>> {
-    e.subexpressions().flat_map(text_in_expr)
+    let text = e.subexpressions().flat_map(text_in_expr);
+    #[cfg(feature = "anyall")]
+    let text = text.chain(quantifier_preds(e).flat_map(text_in_pred));
+    text
+}
+
+/// `text_in_expr` for a node of a `.all`/`.any` predicate
+#[cfg(feature = "anyall")]
+fn text_in_pred(p: &crate::ast::PredExpr) -> Vec<TextKind<'_>> {
+    use crate::ast::PredExprKind;
+    let loc = p.source_loc();
+    match p.expr_kind() {
+        PredExprKind::Lit(lit) => text_in_lit(loc, lit).into_iter().collect(),
+        PredExprKind::ExtensionFunctionApp { fn_name, .. } => text_in_name(loc, fn_name).collect(),
+        PredExprKind::GetAttr { attr, .. } | PredExprKind::HasAttr { attr, .. } => {
+            vec![TextKind::Identifier(loc, attr)]
+        }
+        PredExprKind::ExtHasAttr { attrs, .. } => attrs
+            .iter()
+            .map(|attr| TextKind::Identifier(loc, attr))
+            .collect(),
+        PredExprKind::Like { pattern, .. } => vec![TextKind::Pattern(loc, pattern)],
+        PredExprKind::Record(map) => map
+            .keys()
+            .map(|attr| TextKind::Identifier(loc, attr))
+            .collect(),
+        _ => vec![],
+    }
 }
 
 // Returns a vector containing the text in the top level expression
@@ -433,5 +486,29 @@ mod tests {
             HashSet::from([TextKind::Pattern(None, &p), TextKind::String(None, "test")]),
             strs
         );
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn entities_and_text_inside_quantifier_predicate() {
+        use crate::ast::{BinaryOp, PredExprBuilder};
+        let pb = PredExprBuilder::new;
+        let uid = EntityUID::with_eid_and_type("Photo", "p").unwrap();
+        // `[1].all(it == 1 && Photo::"p".owner == "a")`
+        let p = pb().and(
+            pb().binary_app(BinaryOp::Eq, pb().item(), pb().val(1)).unwrap(),
+            pb().binary_app(
+                BinaryOp::Eq,
+                pb().get_attr(pb().val(uid.clone()), "owner".into()),
+                pb().val("a"),
+            )
+            .unwrap(),
+        );
+        let e = Expr::all(Expr::set([Expr::val(1)]), p);
+        let uids: Vec<EntityUID> = expr_entity_uids(&e).cloned().collect();
+        assert_eq!(uids, vec![uid]);
+        let text: HashSet<TextKind<'_>> = expr_text(&e).collect();
+        assert!(text.contains(&TextKind::Identifier(None, "owner")));
+        assert!(text.contains(&TextKind::String(None, "a")));
     }
 }

@@ -165,6 +165,12 @@ pub enum ValidationError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     EntityDerefLevelViolation(#[from] validation_errors::EntityDerefLevelViolation),
+    /// The predicate of a `.all`/`.any` set quantifier contains a set-typed
+    /// expression
+    #[cfg(feature = "anyall")]
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    SetTermInQuantifier(#[from] validation_errors::SetTermInQuantifier),
 }
 
 impl ValidationError {
@@ -333,6 +339,15 @@ impl ValidationError {
             policy_id,
             msg,
             help,
+        }
+        .into()
+    }
+
+    #[cfg(feature = "anyall")]
+    pub(crate) fn set_term_in_quantifier(source_loc: Option<Loc>, policy_id: PolicyID) -> Self {
+        validation_errors::SetTermInQuantifier {
+            source_loc,
+            policy_id,
         }
         .into()
     }

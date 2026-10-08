@@ -99,6 +99,13 @@ pub enum EvaluationError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     RecursionLimit(#[from] evaluation_errors::RecursionLimitError),
+
+    /// The predicate of a `.all`/`.any` set quantifier errored (or did not
+    /// produce a boolean) on at least one element
+    #[cfg(feature = "anyall")]
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    QuantifierError(#[from] evaluation_errors::QuantifierError),
 }
 
 impl EvaluationError {
@@ -118,6 +125,8 @@ impl EvaluationError {
             Self::RecursionLimit(e) => e.source_loc.as_ref(),
             #[cfg(feature = "tolerant-ast")]
             Self::ASTErrorExpr(e) => e.source_loc.as_ref(),
+            #[cfg(feature = "anyall")]
+            Self::QuantifierError(e) => e.source_loc.as_ref(),
         }
     }
 
@@ -164,6 +173,10 @@ impl EvaluationError {
             }
             Self::RecursionLimit(_) => {
                 Self::RecursionLimit(evaluation_errors::RecursionLimitError { source_loc })
+            }
+            #[cfg(feature = "anyall")]
+            Self::QuantifierError(_) => {
+                Self::QuantifierError(evaluation_errors::QuantifierError { source_loc })
             }
             #[cfg(feature = "tolerant-ast")]
             Self::ASTErrorExpr(_) => {
@@ -335,6 +348,12 @@ impl EvaluationError {
     /// Construct a [`RecursionLimit`] error
     pub(crate) fn recursion_limit(source_loc: Option<Loc>) -> Self {
         evaluation_errors::RecursionLimitError { source_loc }.into()
+    }
+
+    /// Construct a [`QuantifierError`] error
+    #[cfg(feature = "anyall")]
+    pub(crate) fn quantifier_error(source_loc: Option<Loc>) -> Self {
+        evaluation_errors::QuantifierError { source_loc }.into()
     }
 }
 
@@ -730,6 +749,33 @@ pub mod evaluation_errors {
 
         fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
             Some(Box::new("Represents an AST node that failed to parse"))
+        }
+    }
+
+    /// The predicate of a `.all`/`.any` set quantifier errored, or did not
+    /// produce a boolean, on at least one element. Deliberately carries no
+    /// payload: the result is the same whichever element errored, so it does
+    /// not depend on iteration order.
+    //
+    // CAUTION: this type is publicly exported in `cedar-policy`.
+    // Don't make fields `pub`, don't make breaking changes, and use caution
+    // when adding public methods.
+    #[cfg(feature = "anyall")]
+    #[derive(Debug, PartialEq, Eq, Clone, Error)]
+    #[error("the predicate of a set quantifier errored on at least one element")]
+    pub struct QuantifierError {
+        /// Source location
+        pub(crate) source_loc: Option<Loc>,
+    }
+
+    #[cfg(feature = "anyall")]
+    impl Diagnostic for QuantifierError {
+        impl_diagnostic_from_source_loc_opt_field!(source_loc);
+
+        fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+            Some(Box::new(
+                "the predicate must evaluate to a boolean without error for every element of the set",
+            ))
         }
     }
 

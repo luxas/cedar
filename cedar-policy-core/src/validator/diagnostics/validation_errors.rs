@@ -510,6 +510,30 @@ impl Diagnostic for EmptySetForbidden {
     impl_diagnostic_from_source_loc_opt_field!(source_loc);
 }
 
+/// The predicate of a `.all`/`.any` set quantifier contains a sub-expression
+/// whose type is a set (including `it` when the elements are sets). Only
+/// set-free predicates are allowed, because they are the analyzable fragment.
+#[cfg(feature = "anyall")]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Error)]
+#[error("for policy `{policy_id}`, the predicate of a set quantifier contains a set-typed expression")]
+pub struct SetTermInQuantifier {
+    /// Source location
+    pub source_loc: Option<Loc>,
+    /// Policy ID where the error occurred
+    pub policy_id: PolicyID,
+}
+
+#[cfg(feature = "anyall")]
+impl Diagnostic for SetTermInQuantifier {
+    impl_diagnostic_from_source_loc_opt_field!(source_loc);
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(
+            "`.all`/`.any` predicates may not use set values, set literals, or set operators",
+        ))
+    }
+}
+
 /// The policy passes a non-literal to an extension constructor, which is
 /// forbidden in strict validation
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Error)]

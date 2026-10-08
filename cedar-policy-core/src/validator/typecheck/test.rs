@@ -24,6 +24,8 @@
 
 pub(crate) mod test_utils;
 
+#[cfg(feature = "anyall")]
+mod anyall;
 mod expr;
 mod extensions;
 mod namespace;

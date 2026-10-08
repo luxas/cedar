@@ -54,6 +54,8 @@ fn assert_typechecks_strict(
         mode: ValidationMode::Strict,
         policy_id: &expr_id_placeholder(),
         request_env,
+        #[cfg(feature = "anyall")]
+        it_type: None,
     };
     let mut errs = Vec::new();
     let answer =
@@ -81,6 +83,8 @@ fn assert_strict_type_error(
         mode: ValidationMode::Strict,
         policy_id: &expr_id_placeholder(),
         request_env,
+        #[cfg(feature = "anyall")]
+        it_type: None,
     };
     let mut errs = Vec::new();
     let answer =
@@ -174,6 +178,8 @@ fn strict_typecheck_catches_regular_type_error() {
             mode: ValidationMode::Strict,
             policy_id: &expr_id_placeholder(),
             request_env: &q,
+            #[cfg(feature = "anyall")]
+            it_type: None,
         };
         let mut errs = Vec::new();
         typechecker.expect_type(

@@ -81,6 +81,8 @@ impl Validator {
             max_level: max_deref_level.into(),
             level_checking_errors: HashSet::new(),
             schema: &self.schema,
+            #[cfg(feature = "anyall")]
+            it_receiver: None,
         };
         for (req_env, policy_check) in type_annotated_asts {
             match policy_check {
@@ -106,6 +108,10 @@ struct LevelChecker<'a> {
     /// Schema reference needed for computing entity dereference levels
     /// within `ExtHasAttr` nodes (which don't have intermediate type annotations).
     schema: &'a ValidatorSchema,
+    /// Receiver of the `.all`/`.any` whose predicate is being checked, so that
+    /// a dereference of `it` is charged the level of the receiver's elements
+    #[cfg(feature = "anyall")]
+    it_receiver: Option<Expr<Option<Type>>>,
 }
 
 impl LevelChecker<'_> {
@@ -132,6 +138,23 @@ impl LevelChecker<'_> {
     ) -> EntityDerefLevel {
         match e.expr_kind() {
             ExprKind::Var(_) => EntityDerefLevel::zero(),
+            // `it` inside a `.all`/`.any` predicate: an element of the receiver
+            // is as far from the request as the receiver's elements are.
+            #[cfg(feature = "anyall")]
+            ExprKind::Unknown(u) if u.name == super::typecheck::IT_PLACEHOLDER => {
+                match self.it_receiver.clone() {
+                    Some(recv) => self.element_deref_target_level(&recv, access_path, env),
+                    None => {
+                        self.level_checking_errors.insert(
+                            ValidationError::internal_invariant_violation(
+                                e.source_loc().cloned(),
+                                self.policy_id.clone(),
+                            ),
+                        );
+                        EntityDerefLevel::zero()
+                    }
+                }
+            }
             // A slot cannot currently appear in an entity dereference position,
             // but, if it could, we would handle it as an entity literal.
             ExprKind::Slot(_) => {
@@ -237,6 +260,25 @@ impl LevelChecker<'_> {
                     ));
                 EntityDerefLevel::zero()
             }
+        }
+    }
+
+    /// Level of the elements of a set-valued receiver when one of them is
+    /// dereferenced: for a set literal, the maximum over its elements; for any
+    /// other expression, the level of the expression itself.
+    #[cfg(feature = "anyall")]
+    fn element_deref_target_level(
+        &mut self,
+        recv: &Expr<Option<Type>>,
+        access_path: Vec<SmolStr>,
+        env: &RequestEnv<'_>,
+    ) -> EntityDerefLevel {
+        match recv.expr_kind() {
+            ExprKind::Set(elems) => elems
+                .iter()
+                .map(|el| self.check_entity_deref_target_level(el, access_path.clone(), env))
+                .fold(EntityDerefLevel::zero(), EntityDerefLevel::max),
+            _ => self.check_entity_deref_target_level(recv, access_path, env),
         }
     }
 
@@ -385,8 +427,25 @@ impl LevelChecker<'_> {
             // Phase 3; the predicate is a `PredExpr`, which this `Expr` walk
             // does not descend into.
             #[cfg(feature = "anyall")]
-            ExprKind::All { expr, .. } => {
+            ExprKind::All { expr, pred } => {
                 self.check_expr_level(expr, env);
+                let elem_ty = match expr.data() {
+                    Some(Type::Set {
+                        element_type: Some(ty),
+                    }) => Some(ty.as_ref().clone()),
+                    _ => None,
+                };
+                let item = Expr::new(
+                    ExprKind::Unknown(crate::ast::Unknown::new_untyped(
+                        super::typecheck::IT_PLACEHOLDER,
+                    )),
+                    None,
+                    elem_ty,
+                );
+                let inst = pred.instantiate_with(&item);
+                let outer = self.it_receiver.replace(expr.as_ref().clone());
+                self.check_expr_level(&inst, env);
+                self.it_receiver = outer;
             }
             ExprKind::Set(exprs) => {
                 for e in exprs.iter() {
@@ -1190,6 +1249,8 @@ mod levels_validation_tests {
             max_level: EntityDerefLevel::from(3u32),
             level_checking_errors: HashSet::new(),
             schema: &schema,
+            #[cfg(feature = "anyall")]
+            it_receiver: None,
         };
         let entity_ty = Type::entity_lub(["User"]);
         let record_ty = Type::closed_record_with_required_attributes([(
@@ -1355,5 +1416,105 @@ mod levels_validation_tests {
             ["{n: {u: principal}} has n.u.nested.user.bool"],
             2,
         );
+    }
+
+    /// Level validation of `.all` (built as an AST, since the parser does not
+    /// support it yet): returns the errors at `level`.
+    #[cfg(feature = "anyall")]
+    fn all_level_errors(cond: Expr, level: u32) -> Vec<ValidationError> {
+        use crate::ast::{
+            ActionConstraint, Annotations, Effect, PrincipalConstraint, ResourceConstraint,
+            Template,
+        };
+        let t = Template::new(
+            PolicyID::from_string("p"),
+            None,
+            Annotations::new(),
+            Effect::Permit,
+            PrincipalConstraint::any(),
+            ActionConstraint::any(),
+            ResourceConstraint::any(),
+            Some(cond),
+        );
+        let validator = Validator::new(get_schema());
+        let errs = validator
+            .validate_policy_with_level(&t, ValidationMode::Strict, level)
+            .0
+            .collect();
+        errs
+    }
+
+    /// `level` is enough for `cond` and `level - 1` is not
+    #[cfg(feature = "anyall")]
+    #[track_caller]
+    fn assert_all_requires_level(cond: Expr, level: u32) {
+        let errs = all_level_errors(cond.clone(), level);
+        assert!(errs.is_empty(), "unexpected errors at level {level}: {errs:?}");
+        if level > 0 {
+            let errs = all_level_errors(cond, level - 1);
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, ValidationError::EntityDerefLevelViolation(_))),
+                "expected a level violation at level {}: {errs:?}",
+                level - 1
+            );
+        }
+    }
+
+    #[cfg(feature = "anyall")]
+    fn it_bool() -> crate::ast::PredExpr {
+        let pb = crate::ast::PredExprBuilder::new;
+        pb().get_attr(pb().item(), "bool".into())
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn all_without_deref_is_level_zero() {
+        let pb = crate::ast::PredExprBuilder::new;
+        let p = pb()
+            .binary_app(BinaryOp::Less, pb().val(0), pb().item())
+            .unwrap();
+        assert_all_requires_level(Expr::all(Expr::set([Expr::val(1)]), p), 0);
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn all_deref_of_principal_element_is_level_one() {
+        // `[principal].all(it.bool)`
+        let recv = Expr::set([Expr::var(crate::ast::Var::Principal)]);
+        assert_all_requires_level(Expr::all(recv, it_bool()), 1);
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn all_deref_of_derefed_element_is_level_two() {
+        // `[principal.user].all(it.bool)`: the element is one hop away, so
+        // dereferencing it needs two
+        let recv = Expr::set([Expr::get_attr(
+            Expr::var(crate::ast::Var::Principal),
+            "user".into(),
+        )]);
+        assert_all_requires_level(Expr::all(recv, it_bool()), 2);
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn all_level_takes_max_over_set_literal_elements() {
+        // `[principal, principal.user].all(it.bool)`
+        let recv = Expr::set([
+            Expr::var(crate::ast::Var::Principal),
+            Expr::get_attr(Expr::var(crate::ast::Var::Principal), "user".into()),
+        ]);
+        assert_all_requires_level(Expr::all(recv, it_bool()), 2);
+    }
+
+    #[cfg(feature = "anyall")]
+    #[test]
+    fn all_predicate_deref_of_request_var_is_checked() {
+        // `[1].all(principal.bool)`: derefs inside the predicate that do not
+        // involve `it` are checked too
+        let pb = crate::ast::PredExprBuilder::new;
+        let p = pb().get_attr(pb().var(crate::ast::Var::Principal), "bool".into());
+        assert_all_requires_level(Expr::all(Expr::set([Expr::val(1)]), p), 1);
     }
 }
