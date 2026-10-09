@@ -60,6 +60,11 @@
 //!   incomplete) AST even when the input contains syntax errors. This feature is intended
 //!   only for use in language servers, and should never be used on the authorization path.
 //! - `extended-schema` — Extended schema support intended for language servers.
+//! - `anyall` — Non-nested set quantifiers `e.all(p)` / `e.any(p)` over the
+//!   element keyword `it` (enables `cedar-policy-core/anyall`). The predicate
+//!   must be set-free and non-nested; this is what keeps the operators
+//!   analyzable (Mohamed et al., FMCAD 2025). Off by default; included in
+//!   `experimental`.
 //! - (deprecated) `deprecated-schema-compat` — Support for deprecated schema parsing
 //!   behavior. API is stable, but will be removed in a future release.
 //! - (deprecated) `entity-manifest` — Entity manifest computation for entity slicing.
