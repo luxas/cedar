@@ -3153,5 +3153,112 @@ mod tests {
                 Err(ExprToResidualError::StrayIt(_))
             );
         }
+
+        // --- Finding 3: the TPE concrete fold is RE-IMPLEMENTED over `Residual`
+        // (not delegating to the Phase-3 `evaluator.rs:780` arm), so the two
+        // folds are independent paths that this test pins to the same answers.
+        // Each case is a fully-concrete `.all` driven through BOTH the Phase-3
+        // concrete evaluator and the TPE concrete-receiver fold; the two must
+        // agree on true/false/error (incl. the req-2.8 ordering cases). ---
+        #[test]
+        fn concrete_fold_matches_phase3_evaluator() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            #[derive(PartialEq, Debug)]
+            enum Verdict {
+                True,
+                False,
+                Error,
+            }
+            // Every case receives `context.nums` (Set<Long>). The predicate and
+            // the set together exercise true/false/empty/error and the two
+            // error-ordering cases (false-then-error, error-then-false).
+            let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+                ("all_true", "it >= 8000", serde_json::json!([8000_i64, 9000_i64])),
+                ("all_false", "it >= 8000", serde_json::json!([1_i64, 2_i64])),
+                ("empty", "it >= 8000", serde_json::json!([])),
+                ("single_true", "it >= 8000", serde_json::json!([8000_i64])),
+                ("single_false", "it >= 8000", serde_json::json!([1_i64])),
+                ("two_false", "it >= 8000", serde_json::json!([1_i64, 2_i64])),
+                // overflow => every element errors
+                ("overflow", "it + 9223372036854775807 >= 0", serde_json::json!([1_i64, 2_i64])),
+                // false element FIRST, erroring element AFTER (req 2.8)
+                (
+                    "false_then_error",
+                    "it >= 8000 && it + 9223372036854775807 >= 0",
+                    serde_json::json!([0_i64, 9223372036854775807_i64]),
+                ),
+                // erroring element FIRST, false element AFTER (req 2.8)
+                (
+                    "error_then_false",
+                    "it + 9223372036854775807 >= 0 && it >= 8000",
+                    serde_json::json!([9223372036854775807_i64, 0_i64]),
+                ),
+            ];
+            let exts = Extensions::all_available();
+            for (name, pred, nums) in cases {
+                let src = format!("context.nums.all({pred})");
+                let ctx_json = serde_json::json!({ "nums": nums, "strs": [], "recs": [] });
+
+                // --- TPE concrete-receiver fold ---
+                let Ok(Context::Value(ctx)) = Context::from_json_value(ctx_json.clone()) else {
+                    panic!("concrete context")
+                };
+                let preq = PartialRequest::new(
+                    parse_partial_euid(r#"E::"p""#),
+                    r#"Action::"a""#.parse().unwrap(),
+                    parse_partial_euid(r#"E::"r""#),
+                    Some(ctx),
+                    &anyall_schema(),
+                )
+                .unwrap();
+                let peval = Evaluator {
+                    request: &preq,
+                    entities: &PartialEntities::new(),
+                    extensions: exts,
+                };
+                let tpe = peval
+                    .interpret_expr(&parse_typed_expr(
+                        &src,
+                        peval.request,
+                        &anyall_schema(),
+                        &SlotEnv::new(),
+                    ))
+                    .unwrap();
+                let tpe_verdict = if tpe.is_true() {
+                    Verdict::True
+                } else if tpe.is_false() {
+                    Verdict::False
+                } else if tpe.is_error() {
+                    Verdict::Error
+                } else {
+                    panic!("case {name}: TPE did not fully fold a concrete receiver: {tpe:?}")
+                };
+
+                // --- Phase-3 concrete evaluator ---
+                let ctx = Context::from_json_value(ctx_json).unwrap();
+                let req = Request::new_unchecked(
+                    EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                    Some(ctx),
+                );
+                let entities = crate::entities::Entities::new();
+                let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+                let expr: ast::Expr = src.parse().unwrap();
+                let concrete_verdict = match ev.interpret(&expr, &SlotEnv::new()) {
+                    Ok(v) => match v.get_as_bool() {
+                        Ok(true) => Verdict::True,
+                        Ok(false) => Verdict::False,
+                        Err(_) => Verdict::Error,
+                    },
+                    Err(_) => Verdict::Error,
+                };
+
+                assert_eq!(
+                    tpe_verdict, concrete_verdict,
+                    "case {name}: TPE fold and Phase-3 evaluator disagree"
+                );
+            }
+        }
     }
 }
