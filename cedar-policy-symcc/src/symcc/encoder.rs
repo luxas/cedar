@@ -577,7 +577,36 @@ impl<S: tokio::io::AsyncWrite + Unpin + Send> Encoder<'_, S> {
             Term::App { op, args, .. } => {
                 #[cfg(feature = "anyall")]
                 if matches!(op, Op::SetAll) {
-                    return Err(EncodeError::SetAllNotEncoded);
+                    // D-52 tri-valued `set.filter` encoding (HO_ALL), mirroring
+                    // Lean's `Encoder.lean` `set.all` arm:
+                    //   ite (not (set.filter (lambda ((!anyall!it T)) ERR) S = empty))
+                    //       none
+                    //       (some (set.filter (lambda ((!anyall!it T)) P) S = S))
+                    #[expect(clippy::indexing_slicing, reason = "set.all always has 3 args")]
+                    let (set_t, pred_t, err_t) = (&args[0], &args[1], &args[2]);
+                    let elem_ty = match set_t.type_of() {
+                        TermType::Set { ty } => std::sync::Arc::unwrap_or_clone(ty),
+                        _ => return Err(EncodeError::SetAllNotEncoded),
+                    };
+                    let elem_ty_enc = self.encode_type(&elem_ty).await?;
+                    let s_enc = self.encode_term(set_t).await?;
+                    let pred_enc = self.encode_term_inline(pred_t).await?;
+                    let err_enc = self.encode_term_inline(err_t).await?;
+                    let val_filter = format_smolstr!(
+                        "(set.filter (lambda ((!anyall!it {elem_ty_enc})) {pred_enc}) {s_enc})"
+                    );
+                    let err_filter = format_smolstr!(
+                        "(set.filter (lambda ((!anyall!it {elem_ty_enc})) {err_enc}) {s_enc})"
+                    );
+                    let v = format_smolstr!("(= {val_filter} {s_enc})");
+                    let e = format_smolstr!(
+                        "(not (= {err_filter} (as set.empty (Set {elem_ty_enc}))))"
+                    );
+                    let enc = self
+                        .define_term(&ty_enc, &format_smolstr!("(ite {e} (as none {ty_enc}) (some {v}))"))
+                        .await?;
+                    self.terms.insert(t.clone(), enc.clone());
+                    return Ok(enc);
                 }
                 let mut encoded_terms = Vec::with_capacity(args.len());
                 for arg in args.iter() {
@@ -589,6 +618,119 @@ impl<S: tokio::io::AsyncWrite + Unpin + Send> Encoder<'_, S> {
         };
         self.terms.insert(t.clone(), enc.clone());
         Ok(enc)
+    }
+
+    /// Encode a Term *inline* (not in A-normal form) for use inside a
+    /// `set.filter` lambda body (the `set.all` encoding, feature `anyall`,
+    /// D-52/D-53). Mirrors Lean `Encoder.encodeTermInline`. Subterms that do NOT
+    /// mention the reserved bound variable `!anyall!it` are closed w.r.t. the
+    /// binder and delegated to the ANF `encode_term` (returning a top-level id,
+    /// valid inside the lambda); only subterms that mention it are inlined.
+    #[cfg(feature = "anyall")]
+    #[async_recursion]
+    pub async fn encode_term_inline(&mut self, t: &Term) -> Result<SmolStr> {
+        if !mentions_anyall_it(t) {
+            return self.encode_term(t).await;
+        }
+        match t {
+            Term::Var(v) => {
+                if v.id == "!anyall!it" {
+                    Ok(SmolStr::new_static("!anyall!it"))
+                } else {
+                    self.encode_term(t).await
+                }
+            }
+            Term::Some(inner) => {
+                Ok(format_smolstr!("(some {})", self.encode_term_inline(inner).await?))
+            }
+            Term::Set { elts, elts_ty } => {
+                let set_ty_enc = self.encode_type(&TermType::set_of(elts_ty.clone())).await?;
+                if elts.is_empty() {
+                    Ok(format_smolstr!("(as set.empty {set_ty_enc})"))
+                } else {
+                    let mut encs = Vec::with_capacity(elts.len());
+                    for e in elts.iter() {
+                        encs.push(self.encode_term_inline(e).await?);
+                    }
+                    Ok(format_smolstr!(
+                        "(set.insert {} (as set.empty {set_ty_enc}))",
+                        encs.into_iter().join(" ")
+                    ))
+                }
+            }
+            Term::App { op, args, .. } => {
+                let args_slice = args.as_slice();
+                match (op, args_slice) {
+                    (Op::RecordGet(a), [r]) => {
+                        let r_enc = self.encode_term_inline(r).await?;
+                        let r_ty = r.type_of();
+                        let r_id = match self.types.get(&r_ty) {
+                            Some(id) => id.clone(),
+                            None => return Err(EncodeError::MissingTypeEncoding(r_ty.clone())),
+                        };
+                        let a_id = Self::index_of_attr(a, &r_ty)?;
+                        Ok(format_smolstr!("({} {r_enc})", record_attr_id(&r_id, a_id)))
+                    }
+                    (Op::StringLike(p), [a]) => {
+                        let a_enc = self.encode_term_inline(a).await?;
+                        let p_enc = encode_pattern(p).ok_or_else(|| {
+                            EncodeError::EncodePatternFailed(p.clone())
+                        })?;
+                        Ok(format_smolstr!("(str.in_re {a_enc} {p_enc})"))
+                    }
+                    (Op::OptionGet, [a]) => {
+                        Ok(format_smolstr!("(val {})", self.encode_term_inline(a).await?))
+                    }
+                    (Op::Uuf(f), [a]) => {
+                        let f_enc = self.encode_uuf(f).await?;
+                        Ok(format_smolstr!("({f_enc} {})", self.encode_term_inline(a).await?))
+                    }
+                    (Op::Ext(xop), [a]) => {
+                        Ok(format_smolstr!(
+                            "({} {})",
+                            encode_ext_op(xop),
+                            self.encode_term_inline(a).await?
+                        ))
+                    }
+                    (Op::Eq, [a, b]) => {
+                        let a_enc = self.encode_term_inline(a).await?;
+                        let b_enc = self.encode_term_inline(b).await?;
+                        Ok(format_smolstr!("(= {a_enc} {b_enc})"))
+                    }
+                    (Op::ZeroExtend(n), [a]) => {
+                        Ok(format_smolstr!(
+                            "((_ zero_extend {n}) {})",
+                            self.encode_term_inline(a).await?
+                        ))
+                    }
+                    _ => {
+                        let mut encs = Vec::with_capacity(args.len());
+                        for a in args.iter() {
+                            encs.push(self.encode_term_inline(a).await?);
+                        }
+                        Ok(format_smolstr!("({} {})", encode_op(op), encs.into_iter().join(" ")))
+                    }
+                }
+            }
+            // `prim`/`none` never mention the bound var (handled by the fast path
+            // above); `record` with the bound var falls here only if a record
+            // literal mentions `it`, which the set-free predicate fragment does
+            // produce (a record of `it`-attributes) — encode it inline.
+            Term::Record(ats) => {
+                let r_ty = t.type_of();
+                let r_ty_enc = self.encode_type(&r_ty).await?;
+                if ats.is_empty() {
+                    Ok(r_ty_enc)
+                } else {
+                    let mut encs = Vec::with_capacity(ats.len());
+                    for v in ats.values() {
+                        encs.push(self.encode_term_inline(v).await?);
+                    }
+                    Ok(format_smolstr!("({r_ty_enc} {})", encs.into_iter().join(" ")))
+                }
+            }
+            Term::Prim(_) | Term::None(_) => self.encode_term(t).await,
+        }
     }
 
     /// Once you've generated `Asserts` with one of the functions in verifier.rs, you
@@ -718,6 +860,22 @@ fn encode_ext_op(ext_op: &ExtOp) -> &'static str {
         ExtOp::DatetimeOfBitVec => "Datetime",
         ExtOp::DurationVal => "durationVal",
         ExtOp::DurationOfBitVec => "Duration",
+    }
+}
+
+/// Does the term mention the reserved `.all` bound element variable
+/// `!anyall!it`? Mirrors Lean `Term.mentionsAnyAllIt`. A subterm that does not
+/// is closed w.r.t. the `set.filter` binder and can be ANF-lifted (encoded with
+/// `encode_term`); only subterms that do must be encoded inline (D-53).
+#[cfg(feature = "anyall")]
+fn mentions_anyall_it(t: &Term) -> bool {
+    match t {
+        Term::Var(v) => v.id == "!anyall!it",
+        Term::Prim(_) | Term::None(_) => false,
+        Term::Some(inner) => mentions_anyall_it(inner),
+        Term::Set { elts, .. } => elts.iter().any(mentions_anyall_it),
+        Term::Record(ats) => ats.values().any(mentions_anyall_it),
+        Term::App { args, .. } => args.iter().any(mentions_anyall_it),
     }
 }
 
@@ -1086,5 +1244,74 @@ mod deep_extended_has_chain_tests {
         let n_4 = smt_at_4.matches("define-fun").count();
         // Size increases linearly, not exponentially
         assert_eq!(n_3 - n_2, n_4 - n_3);
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+#[expect(clippy::panic, reason = "unit tests")]
+mod anyall_encoder_tests {
+    use std::str::FromStr;
+
+    use cedar_policy::{RequestEnv, Schema};
+
+    use super::*;
+    use crate::symcc::compiler::compile;
+    use crate::symcc::env::SymEnv;
+
+    fn sym_env() -> SymEnv {
+        let schema = Schema::from_cedarschema_str(
+            r#"
+            entity User;
+            entity Thing;
+            action View appliesTo {
+                principal: [User],
+                resource: [Thing],
+                context: { ports: Set<Long> }
+            };
+            "#,
+        )
+        .unwrap()
+        .0;
+        let req = RequestEnv::new(
+            "User".parse().unwrap(),
+            "Action::\"View\"".parse().unwrap(),
+            "Thing".parse().unwrap(),
+        );
+        SymEnv::new(&schema, &req).expect("malformed sym env")
+    }
+
+    async fn encode_expr(s: &str) -> String {
+        let env = sym_env();
+        let term = compile(&cedar_policy_core::ast::Expr::from_str(s).unwrap(), &env).unwrap();
+        let mut encoder = Encoder::new(&env, Vec::<u8>::new()).unwrap();
+        encoder.encode_term(&term).await.unwrap();
+        String::from_utf8(encoder.script).unwrap()
+    }
+
+    // A symbolic `.all` emits the tri-valued two-`set.filter` encoding (D-52):
+    // a value filter `(= (set.filter (lambda ((!anyall!it ...)) P) S) S)` and an
+    // error filter `(not (= (set.filter (lambda ...) ERR) (as set.empty ...)))`,
+    // combined `(ite err none (some val))`. We assert the structural pieces
+    // rather than a full snapshot (ids/types are schema-dependent), which is
+    // enough to prove the HO `set.filter` lambdas are emitted (not the generic
+    // `(set.all ...)` App) and that both value and error filters appear.
+    #[tokio::test]
+    async fn all_emits_two_set_filter_lambdas() {
+        let smt = encode_expr("context.ports.all(it > 0)").await;
+        let filters = smt.matches("set.filter (lambda ((!anyall!it").count();
+        assert_eq!(filters, 2, "expected two set.filter lambdas, got SMT:\n{smt}");
+        assert!(smt.contains("(as set.empty"), "error filter should compare to empty set:\n{smt}");
+        assert!(smt.contains("(as none"), "tri-valued result should carry a none branch:\n{smt}");
+        // The generic App fallback `(set.all ...)` must NOT appear — the op is
+        // emitted as the two filters, never as a bare `set.all` application.
+        assert!(!smt.contains("(set.all "), "set.all must encode via set.filter, not as a bare op:\n{smt}");
+    }
+
+    // `.any` lowers to `!all(!p)`, so its encoding also carries the two filters.
+    #[tokio::test]
+    async fn any_emits_two_set_filter_lambdas() {
+        let smt = encode_expr("context.ports.any(it > 0)").await;
+        let filters = smt.matches("set.filter (lambda ((!anyall!it").count();
+        assert_eq!(filters, 2, "`.any` should still emit two set.filter lambdas:\n{smt}");
     }
 }
