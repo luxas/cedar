@@ -726,7 +726,7 @@ pub fn compile_call(xfn: &cedar_policy_core::ast::Name, ts: Vec<Term>) -> Result
 /// same `compile_*` helpers), so the two engines emit the same Term for the
 /// same predicate.
 #[cfg(feature = "anyall")]
-fn compile_pred(
+pub(crate) fn compile_pred(
     p: &cedar_policy_core::ast::PredExpr,
     it: &Term,
     env: &SymEnv,
@@ -825,7 +825,7 @@ fn compile_pred(
 /// option A) cannot cover, so `compile` rejects it as unsupported. Option B
 /// (set-typed footprint entries) is deferred to Phase 9.
 #[cfg(feature = "anyall")]
-fn pred_mentions_item(p: &cedar_policy_core::ast::PredExpr) -> bool {
+pub(crate) fn pred_mentions_item(p: &cedar_policy_core::ast::PredExpr) -> bool {
     use cedar_policy_core::ast::PredExprKind;
     match p.expr_kind() {
         PredExprKind::Item => true,

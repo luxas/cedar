@@ -137,11 +137,130 @@ pub(crate) fn footprint<'a>(x: &'a Expr, env: &'a SymEnv) -> Box<dyn Iterator<It
             Box::new(exprs.iter().flat_map(|x| footprint(x, env)))
         }
         ExprKind::Record(axs) => Box::new(axs.values().flat_map(|x| footprint(x, env))),
+        // `.all` (feature `anyall`, D-70 A / D-71): the receiver's own footprint,
+        // plus the `it`-free entity subterms of the predicate compiled against
+        // the reserved element variable. Mirrors Lean `footprint`'s `.all` arm
+        // (`footprint x₁ ∪ footprintAllPred p x₁`).
+        #[cfg(feature = "anyall")]
+        ExprKind::All { expr: x1, pred: p } => {
+            Box::new(footprint(x1, env).chain(footprint_all_pred(p, x1, env)))
+        }
         ExprKind::Slot(_) => unimplemented!("analyzing templates is not currently supported"),
         ExprKind::Unknown(_) => {
             unimplemented!("analyzing partial expressions is not currently supported")
         }
         _ => unimplemented!("analyzing `{}` is not currently supported", x),
+    }
+}
+
+/// Footprint of a quantifier predicate `p` compiled against the element term
+/// `it` (feature `anyall`, D-70 A): the entity-typed compiled terms of the
+/// `it`-FREE subexpressions of `p`, in the same `of_entity`/`of_branch` shape as
+/// `footprint` for `Expr` (over `compile_pred`). An `it`-dependent subexpression
+/// contributes only its `it`-free children. Mirrors Lean `footprintPred`.
+#[cfg(feature = "anyall")]
+fn footprint_pred(
+    p: &cedar_policy_core::ast::PredExpr,
+    it: &Term,
+    env: &SymEnv,
+) -> Vec<Term> {
+    use cedar_policy_core::ast::PredExprKind;
+    // `ofEntity q`: if `q` mentions `it` it cannot be grounded; else compile it
+    // and keep it iff it is an option-entity term.
+    let of_entity = |q: &cedar_policy_core::ast::PredExpr| -> Vec<Term> {
+        if super::compiler::pred_mentions_item(q) {
+            return Vec::new();
+        }
+        match super::compiler::compile_pred(q, it, env) {
+            Ok(t) if t.type_of().is_option_entity_type() => vec![t],
+            _ => Vec::new(),
+        }
+    };
+    // `ofBranch c ft1 ft2 ft3`: mirror compile's branch laziness.
+    let of_branch =
+        |c: &cedar_policy_core::ast::PredExpr, ft1: Vec<Term>, ft2: Vec<Term>, ft3: Vec<Term>| -> Vec<Term> {
+            match super::compiler::compile_pred(c, it, env) {
+                Ok(Term::Some(t)) if *t == true.into() => ft2,
+                Ok(Term::Some(t)) if *t == false.into() => ft3,
+                Ok(_) => ft1.into_iter().chain(ft2).chain(ft3).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+    match p.expr_kind() {
+        PredExprKind::Item => Vec::new(),
+        PredExprKind::Lit(_) | PredExprKind::Var(_) => of_entity(p),
+        PredExprKind::If { test_expr, then_expr, else_expr } => of_branch(
+            test_expr,
+            footprint_pred(test_expr, it, env),
+            footprint_pred(then_expr, it, env),
+            footprint_pred(else_expr, it, env),
+        ),
+        PredExprKind::And { left, right } => of_branch(
+            left,
+            footprint_pred(left, it, env),
+            footprint_pred(right, it, env),
+            Vec::new(),
+        ),
+        PredExprKind::Or { left, right } => of_branch(
+            left,
+            footprint_pred(left, it, env),
+            Vec::new(),
+            footprint_pred(right, it, env),
+        ),
+        PredExprKind::BinaryApp { arg1, arg2, .. } => of_entity(p)
+            .into_iter()
+            .chain(footprint_pred(arg1, it, env))
+            .chain(footprint_pred(arg2, it, env))
+            .collect(),
+        PredExprKind::GetAttr { expr, .. } => of_entity(p)
+            .into_iter()
+            .chain(footprint_pred(expr, it, env))
+            .collect(),
+        PredExprKind::HasAttr { expr, .. }
+        | PredExprKind::ExtHasAttr { expr, .. }
+        | PredExprKind::Like { expr, .. }
+        | PredExprKind::Is { expr, .. }
+        | PredExprKind::UnaryApp { arg: expr, .. } => footprint_pred(expr, it, env),
+        PredExprKind::ExtensionFunctionApp { args, .. } => {
+            args.iter().flat_map(|x| footprint_pred(x, it, env)).collect()
+        }
+        PredExprKind::Record(m) => m.values().flat_map(|x| footprint_pred(x, it, env)).collect(),
+    }
+}
+
+/// Footprint of `expr.all(p)`'s predicate (feature `anyall`, D-71): compile the
+/// receiver; if it is a set term, collect `footprint_pred` of `p` against the
+/// element binding, mirroring compile's literal-fold / symbolic split. Kept
+/// separate from `footprint` so the receiver match does not complicate it.
+/// Mirrors Lean `footprintAllPred`.
+#[cfg(feature = "anyall")]
+fn footprint_all_pred(
+    p: &cedar_policy_core::ast::PredExpr,
+    x1: &Expr,
+    env: &SymEnv,
+) -> Vec<Term> {
+    use super::factory::{anyall_it_var, some_of};
+    use super::term_type::TermType;
+    let t = match compile(x1, env) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    if matches!(t, Term::None(_)) {
+        return Vec::new(); // D-69: a `.none` receiver compiles no predicate.
+    }
+    let got = option_get(t);
+    let TermType::Set { ty: elem_ty } = got.type_of() else {
+        return Vec::new();
+    };
+    let elem_ty = std::sync::Arc::unwrap_or_clone(elem_ty);
+    match &got {
+        // D-71: literal set of literal elements ⇒ predicate per element.
+        Term::Set { elts, .. } if elts.iter().all(Term::is_literal) => elts
+            .iter()
+            .flat_map(|vi| footprint_pred(p, &some_of(vi.clone()), env))
+            .collect(),
+        // symbolic ⇒ bind the reserved element variable.
+        _ => footprint_pred(p, &some_of(Term::Var(anyall_it_var(elem_ty))), env),
     }
 }
 

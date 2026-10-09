@@ -161,7 +161,7 @@ impl<S: Solver> SymCompiler<S> {
             self.emit_reset().await?;
             self.solver
                 .smtlib_input()
-                .set_logic("ALL")
+                .set_logic("HO_ALL")
                 .await
                 .map_err(|err| Error::EncodeError(err.into()))?;
             let mut encoder = Encoder::new(symenv, self.solver.smtlib_input())?;
@@ -215,7 +215,7 @@ impl<S: Solver> SymCompiler<S> {
             self.solver.enable_models().await?;
             self.solver
                 .smtlib_input()
-                .set_logic("ALL")
+                .set_logic("HO_ALL")
                 .await
                 .map_err(|err| Error::EncodeError(err.into()))?;
             let mut encoder =
