@@ -3009,6 +3009,132 @@ mod tests {
 
         // --- W4: central stray-`it` backstop (D-32) ---
 
+        // --- Finding 2: reauthorization-parity for the residual soundness invariant (7.2) ---
+
+        #[test]
+        fn reauthorization_parity_residual_all() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // Produce a residual `All` with a genuinely UNKNOWN receiver
+            // (`resource.recs`, resource eid unknown), round-trip it through
+            // `From<Residual> for Expr`, then COMPLETE the receiver with several
+            // concrete sets and assert the completed residual's concrete
+            // evaluation equals full concrete evaluation of the ORIGINAL
+            // expression on the same input (the req-7.2 soundness invariant).
+            let schema = anyall_schema();
+            let src = r#"resource.recs.all(it.n >= 1)"#;
+
+            // 1. TPE with unknown resource => residual, then Expr::from.
+            let Ok(Context::Value(ctx)) =
+                Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+            else {
+                panic!("concrete context")
+            };
+            let preq = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid("E"), // resource unknown
+                Some(ctx),
+                &schema,
+            )
+            .unwrap();
+            let peval = Evaluator {
+                request: &preq,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            let residual = peval
+                .interpret_expr(&parse_typed_expr(src, peval.request, &schema, &SlotEnv::new()))
+                .unwrap();
+            assert!(residual.is_partial(), "receiver unknown => residual All");
+            let roundtripped: ast::Expr = residual.into();
+            let original: ast::Expr = src.parse().unwrap();
+
+            // 2. Complete the receiver with >=4 concrete sets and compare the
+            // concrete evaluation of the round-tripped residual against full
+            // evaluation of the original. The erroring set places the error
+            // AFTER a false element to also exercise req 2.8.
+            let cases: Vec<(&str, serde_json::Value)> = vec![
+                ("all_true", serde_json::json!([{"n": 1}, {"n": 2}])),
+                ("has_false", serde_json::json!([{"n": 0}, {"n": 2}])),
+                ("empty", serde_json::json!([])),
+                ("false_then_ok", serde_json::json!([{"n": 0}, {"n": 5}])),
+            ];
+            let exts = Extensions::all_available();
+            for (name, recs) in cases {
+                let parser: crate::entities::EntityJsonParser<'_, '_> =
+                    crate::entities::EntityJsonParser::new(
+                        None,
+                        exts,
+                        crate::entities::TCComputation::ComputeNow,
+                    );
+                let entities = parser
+                    .from_json_value(serde_json::json!([
+                        { "uid": {"type":"E","id":"r"}, "attrs": { "recs": recs }, "parents": [] }
+                    ]))
+                    .unwrap();
+                let ctx = Context::from_json_value(
+                    serde_json::json!({"nums":[],"strs":[],"recs":[]}),
+                )
+                .unwrap();
+                let req = Request::new_unchecked(
+                    EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                    Some(ctx),
+                );
+                let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+                let got = ev.interpret(&roundtripped, &SlotEnv::new());
+                let want = ev.interpret(&original, &SlotEnv::new());
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => assert_eq!(g, w, "case {name}: value mismatch"),
+                    (Err(_), Err(_)) => {} // both error (QuantifierError image)
+                    _ => panic!("case {name}: residual {got:?} vs original {want:?} disagree"),
+                }
+            }
+
+            // Error-after-false: an overflow predicate. Element {n:0} => `0>=1`
+            // false (no error); element {n:i64::MAX} => `>=1` true then
+            // `n + i64::MAX` overflows => QuantifierError. The error outranks the
+            // earlier false (req 2.8), end-to-end through the round-tripped
+            // residual, and must match full evaluation of the original.
+            let src_err = r#"resource.recs.all(it.n >= 1 && it.n + 9223372036854775807 >= 0)"#;
+            let residual_err = peval
+                .interpret_expr(&parse_typed_expr(src_err, peval.request, &schema, &SlotEnv::new()))
+                .unwrap();
+            let rt_err: ast::Expr = residual_err.into();
+            let orig_err: ast::Expr = src_err.parse().unwrap();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"r"},
+                      "attrs": { "recs": [{"n": 0_i64}, {"n": 9223372036854775807_i64}] },
+                      "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+                .unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+            let got = ev.interpret(&rt_err, &SlotEnv::new());
+            let want = ev.interpret(&orig_err, &SlotEnv::new());
+            // Both must error (QuantifierError), proving no short-circuit on the
+            // earlier false and residual/original agreement.
+            assert!(
+                got.is_err() && want.is_err(),
+                "false-then-error: residual {got:?} vs original {want:?} must both error"
+            );
+        }
+
         #[test]
         fn stray_it_is_rejected_by_tpe_backstop() {
             use crate::ast::Unknown;
