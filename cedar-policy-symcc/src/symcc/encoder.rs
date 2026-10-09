@@ -99,6 +99,14 @@ pub enum EncodeError {
     /// Expecting a record type.
     #[error("expecting a record type, got {0:?}")]
     ExpectRecord(TermType),
+    /// `set.all` (feature `anyall`) term reached the encoder, which does not yet
+    /// emit the two-`set.filter` `HO_ALL` encoding. The Rust `.all` compile arm
+    /// (Phase 6 W3) builds the term; the byte-for-byte encoder emission (and the
+    /// `HO_ALL` logic switch) land with the SymCC differential (Phase 6 W8),
+    /// gated on Phase 5B re-landing and D-74.
+    #[cfg(feature = "anyall")]
+    #[error("SMT encoding of `set.all` is not yet wired (Phase 6 W8)")]
+    SetAllNotEncoded,
     /// Missing type encoding.
     #[error("missing type encoding for {0:?}")]
     MissingTypeEncoding(TermType),
@@ -567,6 +575,10 @@ impl<S: tokio::io::AsyncWrite + Unpin + Send> Encoder<'_, S> {
                 }
             }
             Term::App { op, args, .. } => {
+                #[cfg(feature = "anyall")]
+                if matches!(op, Op::SetAll) {
+                    return Err(EncodeError::SetAllNotEncoded);
+                }
                 let mut encoded_terms = Vec::with_capacity(args.len());
                 for arg in args.iter() {
                     encoded_terms.push(self.encode_term(arg).await?);

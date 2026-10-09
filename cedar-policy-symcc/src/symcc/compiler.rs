@@ -715,6 +715,186 @@ pub fn compile_call(xfn: &cedar_policy_core::ast::Name, ts: Vec<Term>) -> Result
     }
 }
 
+/// Compile a quantifier predicate (`PredExpr`, the body of `.all`, feature
+/// `anyall`) over the reserved element term `it` (a `.option elem_ty` term
+/// standing for the current element, always present). Mirrors `compile` for the
+/// set-free predicate fragment; `PredExprKind::Item` resolves to `it`. Produces
+/// an `.option`-typed term exactly like `compile`.
+///
+/// This is the Rust mirror of Lean `Cedar.SymCC.compilePred`. It is kept
+/// structurally parallel to `compile` above (the predicate fragment reuses the
+/// same `compile_*` helpers), so the two engines emit the same Term for the
+/// same predicate.
+#[cfg(feature = "anyall")]
+fn compile_pred(
+    p: &cedar_policy_core::ast::PredExpr,
+    it: &Term,
+    env: &SymEnv,
+) -> Result<Term> {
+    use cedar_policy_core::ast::PredExprKind;
+    match p.expr_kind() {
+        PredExprKind::Item => Ok(it.clone()),
+        PredExprKind::Lit(l) => compile_prim(l, &env.entities),
+        PredExprKind::Var(v) => compile_var(*v, &env.request),
+        PredExprKind::If {
+            test_expr: x1,
+            then_expr: x2,
+            else_expr: x3,
+        } => compile_if(
+            compile_pred(x1, it, env)?,
+            compile_pred(x2, it, env),
+            compile_pred(x3, it, env),
+        ),
+        PredExprKind::And { left: x1, right: x2 } => {
+            compile_and(compile_pred(x1, it, env)?, compile_pred(x2, it, env))
+        }
+        PredExprKind::Or { left: x1, right: x2 } => {
+            compile_or(compile_pred(x1, it, env)?, compile_pred(x2, it, env))
+        }
+        PredExprKind::UnaryApp { op, arg } => {
+            let t1 = compile_pred(arg, it, env)?;
+            Ok(if_some(t1.clone(), compile_app1(*op, option_get(t1))?))
+        }
+        PredExprKind::BinaryApp { op, arg1, arg2 } => {
+            let t1 = compile_pred(arg1, it, env)?;
+            let t2 = compile_pred(arg2, it, env)?;
+            Ok(if_some(
+                t1.clone(),
+                if_some(
+                    t2.clone(),
+                    compile_app2(*op, option_get(t1), option_get(t2), &env.entities)?,
+                ),
+            ))
+        }
+        PredExprKind::HasAttr { expr, attr } => {
+            let t = compile_pred(expr, it, env)?;
+            Ok(if_some(
+                t.clone(),
+                compile_has_attr(option_get(t), attr, &env.entities)?,
+            ))
+        }
+        PredExprKind::ExtHasAttr { expr, attrs } => {
+            let t = compile_pred(expr, it, env)?;
+            compile_ext_has_attr(t, attrs, &env.entities)
+        }
+        PredExprKind::GetAttr { expr, attr } => {
+            let t = compile_pred(expr, it, env)?;
+            Ok(if_some(
+                t.clone(),
+                compile_get_attr(option_get(t), attr, &env.entities)?,
+            ))
+        }
+        PredExprKind::Like { expr, pattern } => {
+            let t1 = compile_pred(expr, it, env)?;
+            Ok(if_some(
+                t1.clone(),
+                compile_like(option_get(t1), pattern.clone().into())?,
+            ))
+        }
+        PredExprKind::Is { expr, entity_type } => {
+            let t1 = compile_pred(expr, it, env)?;
+            Ok(if_some(
+                t1.clone(),
+                compile_is(
+                    &option_get(t1),
+                    core_entity_type_into_entity_type(entity_type),
+                )?,
+            ))
+        }
+        PredExprKind::ExtensionFunctionApp { fn_name, args } => {
+            let ts = args
+                .iter()
+                .map(|x1| compile_pred(x1, it, env))
+                .collect::<Result<Vec<_>>>()?;
+            compile_call(fn_name, ts)
+        }
+        PredExprKind::Record(axs) => {
+            let ats = axs
+                .iter()
+                .map(|(a1, x1)| Ok((a1.clone(), compile_pred(x1, it, env)?)))
+                .collect::<Result<Vec<_>>>()?;
+            compile_record(ats)
+        }
+    }
+}
+
+/// Whether a predicate contains an `in` whose left operand transitively
+/// mentions the current element `it` (`PredExprKind::Item`). Mirrors Lean
+/// `PredExpr.NoItDependentIn` (returning its negation): such a predicate reads
+/// the ancestors UF at symbolic element UIDs, which the SymCC footprint (D-70
+/// option A) cannot cover, so `compile` rejects it as unsupported. Option B
+/// (set-typed footprint entries) is deferred to Phase 9.
+#[cfg(feature = "anyall")]
+fn pred_mentions_item(p: &cedar_policy_core::ast::PredExpr) -> bool {
+    use cedar_policy_core::ast::PredExprKind;
+    match p.expr_kind() {
+        PredExprKind::Item => true,
+        PredExprKind::Lit(_) | PredExprKind::Var(_) => false,
+        PredExprKind::If {
+            test_expr,
+            then_expr,
+            else_expr,
+        } => {
+            pred_mentions_item(test_expr)
+                || pred_mentions_item(then_expr)
+                || pred_mentions_item(else_expr)
+        }
+        PredExprKind::And { left, right } | PredExprKind::Or { left, right } => {
+            pred_mentions_item(left) || pred_mentions_item(right)
+        }
+        PredExprKind::UnaryApp { arg, .. } => pred_mentions_item(arg),
+        PredExprKind::BinaryApp { arg1, arg2, .. } => {
+            pred_mentions_item(arg1) || pred_mentions_item(arg2)
+        }
+        PredExprKind::GetAttr { expr, .. }
+        | PredExprKind::HasAttr { expr, .. }
+        | PredExprKind::ExtHasAttr { expr, .. }
+        | PredExprKind::Like { expr, .. }
+        | PredExprKind::Is { expr, .. } => pred_mentions_item(expr),
+        PredExprKind::ExtensionFunctionApp { args, .. } => args.iter().any(pred_mentions_item),
+        PredExprKind::Record(axs) => axs.values().any(pred_mentions_item),
+    }
+}
+
+/// `false` iff the predicate has an `in` (`BinaryOp::In`) whose left operand is
+/// `it`-dependent (D-70 A / Lean `PredExpr.NoItDependentIn`).
+#[cfg(feature = "anyall")]
+fn pred_no_it_dependent_in(p: &cedar_policy_core::ast::PredExpr) -> bool {
+    use cedar_policy_core::ast::PredExprKind;
+    match p.expr_kind() {
+        PredExprKind::Item | PredExprKind::Lit(_) | PredExprKind::Var(_) => true,
+        PredExprKind::BinaryApp { op, arg1, arg2 } => {
+            // The one restricted shape: `it`-dependent left operand of `in`.
+            if *op == BinaryOp::In && pred_mentions_item(arg1) {
+                return false;
+            }
+            pred_no_it_dependent_in(arg1) && pred_no_it_dependent_in(arg2)
+        }
+        PredExprKind::If {
+            test_expr,
+            then_expr,
+            else_expr,
+        } => {
+            pred_no_it_dependent_in(test_expr)
+                && pred_no_it_dependent_in(then_expr)
+                && pred_no_it_dependent_in(else_expr)
+        }
+        PredExprKind::And { left, right } | PredExprKind::Or { left, right } => {
+            pred_no_it_dependent_in(left) && pred_no_it_dependent_in(right)
+        }
+        PredExprKind::UnaryApp { arg, .. } => pred_no_it_dependent_in(arg),
+        PredExprKind::GetAttr { expr, .. }
+        | PredExprKind::HasAttr { expr, .. }
+        | PredExprKind::ExtHasAttr { expr, .. }
+        | PredExprKind::Like { expr, .. }
+        | PredExprKind::Is { expr, .. } => pred_no_it_dependent_in(expr),
+        PredExprKind::ExtensionFunctionApp { args, .. } => {
+            args.iter().all(pred_no_it_dependent_in)
+        }
+        PredExprKind::Record(axs) => axs.values().all(pred_no_it_dependent_in),
+    }
+}
+
 /// Given an expression `x` that has type `τ` with respect to a type environment
 /// `Γ`, and given a well-formed symbolic environment `env` that conforms to `Γ`,
 /// `compile x env` succeeds and produces a well-formed term of type `.option τ.toTermType`.
@@ -816,6 +996,93 @@ pub fn compile(x: &Expr, env: &SymEnv) -> Result<Term> {
         ExprKind::Unknown(_) => Err(CompileError::UnsupportedFeature(
             "partial evaluation is not supported".to_string(),
         )),
+        // `.all` (feature `anyall`, D-52/D-68/D-69/D-70-A). Mirror of the Lean
+        // `compile` `.all` arm: compile the receiver to a set term, bind the
+        // element variable, compile the predicate over it, and build the
+        // tri-valued `set.all` term (two `set.filter` comprehensions). Error
+        // propagates from the receiver via `if_some`.
+        #[cfg(feature = "anyall")]
+        ExprKind::All { expr: x1, pred: p } => {
+            // D-70 option A / D-71 guard: a predicate whose `in` has an
+            // `it`-dependent left operand reads the ancestors UF at symbolic
+            // element UIDs, which the footprint (option A) cannot cover; reject
+            // it as unsupported (option B is deferred to Phase 9). On well-typed
+            // Part-A input this never fires.
+            if !pred_no_it_dependent_in(p) {
+                return Err(CompileError::UnsupportedFeature(
+                    "`.all`/`.any` predicate with an `it`-dependent left operand of `in` is not supported by SymCC (D-70 option A)".to_string(),
+                ));
+            }
+            let t = compile(x1, env)?;
+            match &t {
+                // D-69: short-circuit a `.none` (erroring) receiver without
+                // compiling the predicate (dead branches are not type-checked in
+                // SymCC). `if_some(none, g) = none_of(.bool)` for the
+                // `.option .bool`-typed quantifier value, so return that
+                // directly. A non-set `.none` is still a type error.
+                Term::None(ty) => match ty {
+                    TermType::Set { .. } => Ok(factory::none_of(TermType::Bool)),
+                    _ => Err(CompileError::TypeError),
+                },
+                _ => {
+                    let got = option_get(t.clone());
+                    match got.type_of() {
+                        TermType::Set { ty: elem_ty } => {
+                            let elem_ty = Arc::unwrap_or_clone(elem_ty);
+                            // D-68: fold concretely over a *literal* set of
+                            // *literal* elements by compiling the predicate PER
+                            // ELEMENT (`it := some_of(vi)`), producing reduced
+                            // bodies. Otherwise bind the reserved element
+                            // variable and build the symbolic `.app set.all`.
+                            match &got {
+                                Term::Set { elts, .. } if elts.iter().all(Term::is_literal) => {
+                                    let mut pts = Vec::with_capacity(elts.len());
+                                    for vi in elts.iter() {
+                                        let pti = compile_pred(p, &some_of(vi.clone()), env)?;
+                                        // D-65 per element: Bool-typed.
+                                        if option_get(pti.clone()).type_of() != TermType::Bool {
+                                            return Err(CompileError::TypeError);
+                                        }
+                                        pts.push(pti);
+                                    }
+                                    let conj = pts.iter().rev().fold(Term::from(true), |acc, pti| {
+                                        factory::and(option_get(pti.clone()), acc)
+                                    });
+                                    let any_err =
+                                        pts.iter().rev().fold(Term::from(false), |acc, pti| {
+                                            factory::or(factory::not(is_some(pti.clone())), acc)
+                                        });
+                                    Ok(if_some(
+                                        t,
+                                        ite(any_err, factory::none_of(TermType::Bool), some_of(conj)),
+                                    ))
+                                }
+                                _ => {
+                                    let it_var =
+                                        some_of(Term::Var(factory::anyall_it_var(elem_ty)));
+                                    let pt = compile_pred(p, &it_var, env)?;
+                                    // D-65: the per-element predicate must be
+                                    // Bool-typed (always holds on well-typed
+                                    // input; lets `set.all` be built well-formed).
+                                    if option_get(pt.clone()).type_of() != TermType::Bool {
+                                        return Err(CompileError::TypeError);
+                                    }
+                                    Ok(if_some(
+                                        t.clone(),
+                                        factory::set_all(
+                                            option_get(t),
+                                            option_get(pt.clone()),
+                                            factory::not(is_some(pt)),
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => Err(CompileError::TypeError),
+                    }
+                }
+            }
+        }
         _ => Err(CompileError::UnsupportedFeature(format!(
             "symbolic compilation of `{}` is not supported",
             x
@@ -1722,5 +1989,126 @@ pub(crate) mod ext_has_attr_tests {
                 .all(|(prev, next)| prev == next),
             "distinct-node count should grow linearly, got distinct={distinct:?} diffs={diffs:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+#[expect(clippy::panic, reason = "unit tests")]
+mod anyall_tests {
+    use std::str::FromStr;
+
+    use cedar_policy::{RequestEnv, Schema};
+    use cool_asserts::assert_matches;
+
+    use super::*;
+    use crate::op::Op;
+
+    // A schema with a *symbolic* set-typed context attribute (`ports`) and an
+    // entity set attribute, so a `.all` receiver is an opaque set term (the
+    // symbolic `set.all` path), not a literal.
+    fn schema() -> Schema {
+        let schema = r#"
+            entity User;
+            entity Thing;
+            action View appliesTo {
+                principal: [User],
+                resource: [Thing],
+                context: { ports: Set<Long>, names: Set<String>, friends: Set<User> }
+            };
+        "#;
+        Schema::from_cedarschema_str(schema).unwrap().0
+    }
+
+    fn sym_env() -> SymEnv {
+        let req = RequestEnv::new(
+            "User".parse().unwrap(),
+            "Action::\"View\"".parse().unwrap(),
+            "Thing".parse().unwrap(),
+        );
+        SymEnv::new(&schema(), &req).expect("malformed sym env")
+    }
+
+    fn parse_expr(s: &str) -> Expr {
+        Expr::from_str(s).unwrap_or_else(|e| panic!("could not parse `{s}`: {e}"))
+    }
+
+    // Symbolic receiver (`context.ports` is an opaque set term) ⇒ the compiled
+    // term is the tri-valued `if_some(_, set.all(...))` node (D-68 symbolic
+    // path). We assert the shape: an outer `ite`/`App` whose receiver branch
+    // carries an `Op::SetAll` application of three args.
+    #[test]
+    fn all_symbolic_receiver_builds_set_all_node() {
+        let t = compile(&parse_expr("context.ports.all(it > 0)"), &sym_env()).unwrap();
+        // The quantifier value is `.option .bool`.
+        assert_eq!(t.type_of(), TermType::option_of(TermType::Bool));
+        // Somewhere in the term is exactly one `Op::SetAll` App with 3 args.
+        fn count_set_all(t: &Term) -> usize {
+            match t {
+                Term::App { op: Op::SetAll, args, .. } => {
+                    assert_eq!(args.len(), 3, "set.all takes [set, pred, err]");
+                    1 + args.iter().map(count_set_all).sum::<usize>()
+                }
+                Term::App { args, .. } => args.iter().map(count_set_all).sum(),
+                Term::Some(inner) => count_set_all(inner),
+                Term::Set { elts, .. } => elts.iter().map(count_set_all).sum(),
+                Term::Record(ats) => ats.values().map(count_set_all).sum(),
+                _ => 0,
+            }
+        }
+        assert_eq!(
+            count_set_all(&t),
+            1,
+            "symbolic `.all` should build exactly one `set.all` node, got term: {t}"
+        );
+    }
+
+    // `.any` lowers to `!all(!p)`, so it still produces a `set.all` node.
+    #[test]
+    fn any_symbolic_receiver_builds_set_all_node() {
+        let t = compile(&parse_expr("context.ports.any(it > 0)"), &sym_env()).unwrap();
+        assert_eq!(t.type_of(), TermType::option_of(TermType::Bool));
+        fn has_set_all(t: &Term) -> bool {
+            match t {
+                Term::App { op: Op::SetAll, .. } => true,
+                Term::App { args, .. } => args.iter().any(has_set_all),
+                Term::Some(inner) => has_set_all(inner),
+                _ => false,
+            }
+        }
+        assert!(has_set_all(&t), "`.any` should still build a `set.all` node");
+    }
+
+    // D-68 literal-fold path: a *literal* set receiver compiles the predicate
+    // per element, so NO `set.all` node is built — the result is a folded
+    // `ite(any_err, none, some(conj))`.
+    #[test]
+    fn all_literal_receiver_folds_without_set_all_node() {
+        let t = compile(&parse_expr("[1, 2, 3].all(it > 0)"), &sym_env()).unwrap();
+        assert_eq!(t.type_of(), TermType::option_of(TermType::Bool));
+        fn has_set_all(t: &Term) -> bool {
+            match t {
+                Term::App { op: Op::SetAll, .. } => true,
+                Term::App { args, .. } => args.iter().any(has_set_all),
+                Term::Some(inner) => has_set_all(inner),
+                Term::Set { elts, .. } => elts.iter().any(has_set_all),
+                Term::Record(ats) => ats.values().any(has_set_all),
+                _ => false,
+            }
+        }
+        assert!(
+            !has_set_all(&t),
+            "literal-set `.all` should fold per element, not build a `set.all` node: {t}"
+        );
+    }
+
+    // D-70 option A guard: an `it`-dependent left operand of `in` is rejected
+    // with `UnsupportedFeature` (both engines agree on this rejection; W8).
+    #[test]
+    fn all_it_dependent_in_is_unsupported() {
+        // `context.friends` is a `Set<User>`, so `it` is a `User` entity and
+        // `it in principal` has `it` as the LEFT operand of `in` (the ancestors
+        // UF over a symbolic element UID — the case option A rejects).
+        let res = compile(&parse_expr("context.friends.all(it in principal)"), &sym_env());
+        assert_matches!(res, Err(CompileError::UnsupportedFeature(_)));
     }
 }

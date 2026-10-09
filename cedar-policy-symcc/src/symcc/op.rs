@@ -98,6 +98,14 @@ pub enum Op {
     RecordGet(Attr), // Core ADT operator with trusted mapping to SMT
 
     //   ---------- CVC theory of finite sets (`FS`) ----------
+    /// The SymCC encoding node for `Expr::all` (feature `anyall`, D-52).
+    /// Applied to `[set, predicate, error_predicate]`, where `predicate` and
+    /// `error_predicate` are boolean Terms over the reserved element variable
+    /// (`anyall_it_var`): `predicate` denotes `P[it]` and `error_predicate`
+    /// denotes "`P` errors on `it`". The result is `.option .bool` (tri-valued,
+    /// D-35). Encodes under logic `HO_ALL` via two `set.filter` comprehensions.
+    #[cfg(feature = "anyall")]
+    SetAll,
     SetMember,
     SetSubset,
     SetInter,
@@ -162,6 +170,8 @@ impl Op {
             Op::SetMember => "set.member",
             Op::SetSubset => "set.subset",
             Op::SetInter => "set.inter",
+            #[cfg(feature = "anyall")]
+            Op::SetAll => "set.all",
             Op::OptionGet => "option.get",
             Op::RecordGet(_) => "record.get",
             Op::StringLike(_) => "string.like",
