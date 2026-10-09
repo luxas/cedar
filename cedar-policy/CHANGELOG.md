@@ -14,6 +14,14 @@ Starting with version 3.2.4, changes marked with a star (*) are _language breaki
 
 Cedar Language Version: TBD
 
+### Added
+
+- (experimental, `anyall`) Non-nested set quantifiers `e.all(p)` / `e.any(p)` over the
+  element keyword `it`, behind the off-by-default `anyall` feature (included in
+  `experimental`). The predicate must be set-free and non-nested; this restriction keeps
+  the operators analyzable (Mohamed et al., FMCAD 2025). See the `anyall-set-operators`
+  spec for the full design.
+
 ## [4.13.0] - 2026-09-15
 
 Cedar Language Version: 4.5
