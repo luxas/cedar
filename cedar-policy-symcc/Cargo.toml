@@ -35,6 +35,10 @@ insta = "1.47"
 [features]
 experimental = ["variadic-is-in-range"]
 variadic-is-in-range = []
+# Non-nested `.any`/`.all` set operators (spec: anyall-set-operators).
+# Passthrough to the core/public crates so the SymCC `.all` compile arm
+# (feature-gated on `cedar-policy-core`'s `ExprKind::All`) is enabled.
+anyall = ["cedar-policy-core/anyall", "cedar-policy/anyall"]
 
 [lints]
 workspace = true
