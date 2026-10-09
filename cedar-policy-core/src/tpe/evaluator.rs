@@ -2933,6 +2933,39 @@ mod tests {
         }
 
         #[test]
+        fn residual_all_and_false_stays_residual() {
+            // `<residual All> && false` must NOT fold to `Concrete(false)`: the
+            // `.all` can raise a QuantifierError, so the `&&` simplifier keeps
+            // the node (behavioural guard for `can_error_assuming_well_formed`,
+            // review Finding 1). If `All` wrongly reported it cannot error, this
+            // would collapse to `false`.
+            let schema = anyall_schema();
+            let Ok(Context::Value(context)) =
+                Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+            else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid("E"), // resource eid unknown => receiver residual
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            // Kept as `<All> && false`, not simplified to `false`.
+            assert_snapshot!(
+                interpret_typed_str_to_str(&eval, r#"resource.recs.all(it.n >= 1) && false"#, &schema),
+                @"resource.recs.all(!(it.n < 1)) && false"
+            );
+        }
+
+        #[test]
         fn concrete_receiver_residual_predicate_keeps_node() {
             // Concrete receiver, but the predicate reads an UNKNOWN request
             // attribute (`resource.unknownish` via a residual sub-term): under

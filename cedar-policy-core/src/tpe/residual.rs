@@ -1079,5 +1079,23 @@ pub(super) mod test {
                 ])
             );
         }
+
+        #[test]
+        fn all_can_error_assuming_well_formed() {
+            // A quantifier can raise a `QuantifierError`, so a residual `All`
+            // MUST report it can error — otherwise the `&&`/`||` simplifier
+            // would drop a possibly-erroring `.all` (PLAN R2 / review Finding
+            // 1). Guards the `=> true` arm in `can_error_assuming_well_formed`.
+            assert_eq!(
+                parse_residual(r#"principal.set.all(it == "x")"#).can_error_assuming_well_formed(),
+                true
+            );
+            // Still true even when the receiver itself cannot error.
+            assert_eq!(
+                parse_residual(r#"[User::"a"].all(it == User::"b")"#)
+                    .can_error_assuming_well_formed(),
+                true
+            );
+        }
     }
 }
