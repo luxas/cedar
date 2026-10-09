@@ -91,3 +91,62 @@ async fn symbolic_all_different_guard_is_not_equivalent() {
     .await;
     assert!(!eq, "`it > 0` and `it >= 0` quantifier guards must NOT be equivalent (SAT)");
 }
+
+// F-6: an entity-set `.all` whose predicate has a NON-EMPTY entity footprint
+// (`it == principal`), driven end-to-end through cvc5. Unlike the `Set<Long>`
+// cases above, this exercises the receiver + predicate entity-footprint union
+// (enforcer `footprint`'s `.all` arm) through the SMT solve path, so a footprint
+// that produced malformed SMT or a crash would surface here. The two guards
+// (`it == principal` vs `it == resource.owner`) differ, so cvc5 must DECIDE a
+// counterexample ⇒ NOT equivalent.
+//
+// NOTE on "a missing footprint would flip the verdict": that is NOT feasible to
+// construct for any `.all` the compiler accepts. The only footprint-sensitive op
+// is `in` (the ancestors UF), and D-70-A (`pred_no_it_dependent_in`) REJECTS an
+// `it`-dependent left operand of `in` inside a predicate — the one shape whose
+// element UIDs the footprint would have to cover. An `==`/attribute predicate
+// (the supported entity shape) never consumes the ancestor UF, so its `it`-free
+// entity term's acyclicity/transitivity assumption cannot change a sat/unsat
+// verdict. Hence the footprint correctness guard is the DETERMINISTIC
+// `enforcer.rs` unit test (F-6), and this cvc5 case only confirms the entity
+// footprint path solves cleanly, not that a missing term flips the answer.
+#[tokio::test]
+async fn entity_set_all_different_guard_is_not_equivalent() {
+    let validator = Validator::new(entity_schema());
+    let pset1 = pset_from_text(
+        r#"permit(principal, action, resource) when { resource.owners.all(it == principal) };"#,
+        &validator,
+    );
+    let pset2 = pset_from_text(
+        r#"permit(principal, action, resource) when { resource.owners.all(it == resource.owner) };"#,
+        &validator,
+    );
+    let envs = Environments::new(validator.schema(), "User", "Action::\"view\"", "Doc");
+    let typed1 =
+        WellTypedPolicies::from_policies(&pset1, &envs.req_env, envs.schema).unwrap();
+    let typed2 =
+        WellTypedPolicies::from_policies(&pset2, &envs.req_env, envs.schema).unwrap();
+    let mut compiler = CedarSymCompiler::new(LocalSolver::cvc5().unwrap()).unwrap();
+    let eq = compiler
+        .check_equivalent(&typed1, &typed2, &envs.symenv)
+        .await
+        .expect("cvc5 should solve the entity-set `.all` query under HO_ALL");
+    assert!(
+        !eq,
+        "`it == principal` and `it == resource.owner` guards must NOT be equivalent (SAT)"
+    );
+}
+
+fn entity_schema() -> Schema {
+    schema_from_cedarstr(
+        r#"
+        entity User;
+        entity Doc { owner: User, owners: Set<User> };
+        action view appliesTo {
+          principal: [User],
+          resource: [Doc],
+          context: {}
+        };
+    "#,
+    )
+}

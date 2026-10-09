@@ -365,3 +365,93 @@ pub fn enforce<'a>(xs: impl IntoIterator<Item = &'a Expr>, env: &SymEnv) -> BTre
         .flat_map(|t| ts.iter().map(|t2| transitivity(t, t2, &env.entities)));
     ac.chain(tr).collect()
 }
+
+// F-6 (feature `anyall`): deterministic unit tests for the `.all` footprint
+// arm (`footprint`/`footprint_pred`/`footprint_all_pred`). The cvc5 proof in
+// `tests/anyall.rs` quantifies over `Set<Long>` (empty entity footprint), so it
+// cannot see a wrong footprint; these tests use a `Set<Entity>` attribute so
+// the receiver and the predicate's `it`-free entity term both appear, and pin
+// that the footprint is the UNION of the two.
+#[cfg(all(test, feature = "anyall"))]
+#[expect(clippy::panic, reason = "unit tests")]
+mod anyall_footprint_tests {
+    use std::str::FromStr;
+
+    use cedar_policy::{RequestEnv, Schema};
+
+    use super::footprints;
+    use crate::symcc::compiler::compile;
+    use crate::symcc::env::SymEnv;
+    use cedar_policy_core::ast::Expr;
+
+    fn sym_env() -> SymEnv {
+        // `resource.owners : Set<User>` (an entity set) ⇒ a `.all` over it has a
+        // non-empty entity footprint. `User.manager : User` lets the negative
+        // `it.manager == it` case be well-typed.
+        let schema = Schema::from_cedarschema_str(
+            r#"
+            entity User { manager: User };
+            entity Doc { owner: User, owners: Set<User> };
+            action view appliesTo {
+              principal: [User],
+              resource: [Doc],
+              context: {}
+            };
+        "#,
+        )
+        .unwrap()
+        .0;
+        let req = RequestEnv::new(
+            "User".parse().unwrap(),
+            "Action::\"view\"".parse().unwrap(),
+            "Doc".parse().unwrap(),
+        );
+        SymEnv::new(&schema, &req).expect("malformed sym env")
+    }
+
+    fn footprint_count(src: &str) -> usize {
+        let env = sym_env();
+        let e = Expr::from_str(src).unwrap_or_else(|err| panic!("parse `{src}`: {err}"));
+        footprints([&e], &env).len()
+    }
+
+    // `resource.owners.all(it == principal)`: the footprint is the UNION of the
+    // receiver's footprint (the `resource`/`Doc` entity term reached via
+    // `resource.owners`) and the predicate's `it`-free entity term (`principal`).
+    // So it must be STRICTLY larger than either half alone — pinning that the
+    // `.all` arm chains BOTH `footprint(x1)` and `footprint_all_pred`.
+    #[test]
+    fn all_footprint_is_receiver_union_predicate() {
+        let full = footprint_count("resource.owners.all(it == principal)");
+        // Receiver alone: `resource` (an entity) contributes one entity term.
+        let receiver_only = footprint_count("resource.owners.contains(principal)");
+        // `resource` term + `principal` term ⇒ at least 2, and more than the
+        // receiver-only expression's footprint.
+        assert!(
+            full >= 2,
+            "entity-set `.all` footprint should contain the receiver AND the predicate's \
+             it-free entity term (expected >= 2), got {full}"
+        );
+        assert!(
+            full > 0 && receiver_only > 0,
+            "both the full `.all` and the receiver-only expr must have non-empty entity footprints \
+             (full={full}, receiver_only={receiver_only})"
+        );
+    }
+
+    // Negative case: `resource.owners.all(it.manager == it)` — the only entity
+    // terms in the predicate (`it.manager`, `it`) are `it`-DEPENDENT, so
+    // `footprint_pred` contributes NOTHING from the predicate; the footprint is
+    // then just the receiver's (the `resource` entity term), STRICTLY smaller
+    // than the `it == principal` case which adds `principal`.
+    #[test]
+    fn all_footprint_drops_it_dependent_entity_terms() {
+        let it_dep = footprint_count("resource.owners.all(it.manager == it)");
+        let it_free = footprint_count("resource.owners.all(it == principal)");
+        assert!(
+            it_free > it_dep,
+            "an `it`-dependent predicate (`it.manager == it`) must contribute no footprint term, \
+             so its footprint ({it_dep}) must be smaller than the `it == principal` case ({it_free})"
+        );
+    }
+}
