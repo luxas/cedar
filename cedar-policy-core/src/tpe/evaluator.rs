@@ -554,6 +554,64 @@ impl Evaluator<'_> {
                     mk_residual(ResidualKind::Record(Arc::new(record)))
                 }
             }
+            // Phase 6.5 (D-80, reqs 7.1/7.2/7.3/7.4). `.all`/`.any`.
+            #[cfg(feature = "anyall")]
+            ResidualKind::All { expr, pred } => {
+                let recv = self.interpret(expr);
+                match &recv {
+                    // Receiver error propagates (matches the concrete evaluator,
+                    // which fails on a receiver error).
+                    Residual::Error(_) => mk_error(),
+                    // Residual receiver: keep the whole quantifier node (7.2).
+                    // The receiver is already partially evaluated.
+                    Residual::Partial { .. } => mk_residual(ResidualKind::All {
+                        expr: Arc::new(recv),
+                        pred: pred.clone(),
+                    }),
+                    // Concrete receiver: fold per element exactly like the
+                    // Phase-3 concrete evaluator (`evaluator.rs` `.all` arm):
+                    // non-set receiver => error; per element instantiate the
+                    // predicate and interpret it; any erroring/non-bool element
+                    // => QuantifierError image (`mk_error`); NO short-circuit on
+                    // a `false` element, because a later element may still error
+                    // (reqs 2.5/2.8); empty set => `true`. If any element's
+                    // predicate stays residual, conservatively keep the whole
+                    // node residual with the receiver rebuilt from its concrete
+                    // value so it is not re-folded (7.3's full per-element
+                    // refinement is deferred, D-80 / Phase 9).
+                    Residual::Concrete { value, .. } => {
+                        let set = match value.get_as_set() {
+                            Ok(set) => set,
+                            Err(_) => return mk_error(),
+                        };
+                        let mut all_true = true;
+                        let mut any_residual = false;
+                        for elem in set.iter() {
+                            let inst = pred.instantiate(elem);
+                            let elem_residual =
+                                self.interpret(&Residual::from_untyped_expr(&inst, r.ty()));
+                            match &elem_residual {
+                                Residual::Error(_) => return mk_error(),
+                                Residual::Concrete { value, .. } => match value.get_as_bool() {
+                                    Ok(b) => all_true &= b,
+                                    // A non-boolean per-element result is a
+                                    // QuantifierError, matching Lean/Rust (D-16).
+                                    Err(_) => return mk_error(),
+                                },
+                                Residual::Partial { .. } => any_residual = true,
+                            }
+                        }
+                        if any_residual {
+                            mk_residual(ResidualKind::All {
+                                expr: Arc::new(recv),
+                                pred: pred.clone(),
+                            })
+                        } else {
+                            mk_concrete(all_true.into())
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2734,5 +2792,473 @@ mod tests {
             interpret_typed_str_to_str(r#"resource.rec"#),
             @r#"{a: 1, dt: datetime("1970-01-01").offset(duration("1790812800000ms")), z: 2}"#
         );
+    }
+
+    // ---- Phase 6.5: TPE of `.all` / `.any` (reqs 7.1/7.2/7.3/7.4, D-80) ----
+    #[cfg(feature = "anyall")]
+    mod anyall {
+        use super::*;
+
+        fn anyall_schema() -> ValidatorSchema {
+            parse_schema(
+                r#"entity E { recs: Set<{ n: Long }> };
+                   action a appliesTo {
+                     principal: E, resource: E,
+                     context: { nums: Set<Long>, strs: Set<String>, recs: Set<{ n: Long }> }
+                   };"#,
+            )
+        }
+
+        /// Build an evaluator whose context (hence `context.*` set attributes)
+        /// is concrete, so a `.all` receiver reduces to a `Concrete` set.
+        fn concrete_ctx_eval(ctx: serde_json::Value) -> (PartialRequest, ValidatorSchema) {
+            let schema = anyall_schema();
+            let Ok(Context::Value(context)) = Context::from_json_value(ctx) else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid(r#"E::"r""#),
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            (req, schema)
+        }
+
+        #[track_caller]
+        fn run(ctx: serde_json::Value, expr: &str) -> String {
+            let (req, schema) = concrete_ctx_eval(ctx);
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            interpret_typed_str_to_str(&eval, expr, &schema)
+        }
+
+        // --- W2: concrete-receiver fold (7.1/7.3) ---
+
+        #[test]
+        fn concrete_all_true() {
+            // every element satisfies the predicate => true
+            assert_snapshot!(run(serde_json::json!({"nums":[8000,9000],"strs":[],"recs":[]}),
+                r#"context.nums.all(it >= 8000)"#), @"true");
+        }
+
+        #[test]
+        fn concrete_all_false() {
+            assert_snapshot!(run(serde_json::json!({"nums":[1,2],"strs":[],"recs":[]}),
+                r#"context.nums.all(it >= 8000)"#), @"false");
+        }
+
+        #[test]
+        fn concrete_all_empty_is_true() {
+            // empty set => true, no QuantifierError (req 2.7)
+            assert_snapshot!(run(serde_json::json!({"nums":[],"strs":[],"recs":[]}),
+                r#"context.nums.all(it >= 8000)"#), @"true");
+        }
+
+        #[test]
+        fn concrete_any_lowering() {
+            // `.any(p)` lowers to `!all(!p)`; some element >= 8000 => true
+            assert_snapshot!(run(serde_json::json!({"nums":[1,9000],"strs":[],"recs":[]}),
+                r#"context.nums.any(it >= 8000)"#), @"true");
+            assert_snapshot!(run(serde_json::json!({"nums":[1,2],"strs":[],"recs":[]}),
+                r#"context.nums.any(it >= 8000)"#), @"false");
+        }
+
+        #[test]
+        fn concrete_record_elements() {
+            // B1: elements are records; predicate reads an attribute of `it` (7.1)
+            assert_snapshot!(run(serde_json::json!({"nums":[],"strs":[],"recs":[{"n":1},{"n":2}]}),
+                r#"context.recs.all(it.n >= 1)"#), @"true");
+            assert_snapshot!(run(serde_json::json!({"nums":[],"strs":[],"recs":[{"n":0},{"n":2}]}),
+                r#"context.recs.all(it.n >= 1)"#), @"false");
+        }
+
+        #[test]
+        fn concrete_string_elements_like() {
+            assert_snapshot!(run(serde_json::json!({"nums":[],"strs":["ab","ac"],"recs":[]}),
+                r#"context.strs.all(it like "a*")"#), @"true");
+        }
+
+        // --- 2.8: no short-circuit on false; an erroring element outranks false ---
+
+        #[test]
+        fn false_then_error_is_quantifier_error_not_false() {
+            // 0 makes `it >= 8000` false; the division-by-zero-style error here
+            // is a non-boolean/erroring predicate on another element. We use an
+            // integer-overflow predicate to force an element error.
+            // Element 0: 0 >= 8000 = false. Element with overflow: errors.
+            // The whole `.all` must be the QuantifierError image (Error), NOT
+            // `false` — proving no short-circuit on the false element (2.8).
+            // `9223372036854775807 + 1` overflows => predicate errors.
+            let out = run(serde_json::json!({"nums":[0_i64, 9223372036854775807_i64],"strs":[],"recs":[]}),
+                r#"context.nums.all(it >= 8000 && it + 1 > it)"#);
+            // Error residual prints as the synthetic `error()` extension call.
+            assert_snapshot!(out, @"error()");
+        }
+
+        // --- W3: residual-receiver passthrough (7.2) + reauthorization parity ---
+
+        #[test]
+        fn residual_receiver_keeps_node() {
+            // `resource` is unknown => `resource.recs` stays residual => the
+            // whole `.all` is retained (not errored, not discarded) (7.2).
+            let schema = anyall_schema();
+            let Ok(Context::Value(context)) =
+                Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+            else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid("E"), // resource eid unknown
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            assert_snapshot!(
+                interpret_typed_str_to_str(&eval, r#"resource.recs.all(it.n >= 1)"#, &schema),
+                @"resource.recs.all(!(it.n < 1))"
+            );
+        }
+
+        #[test]
+        fn residual_all_and_false_stays_residual() {
+            // `<residual All> && false` must NOT fold to `Concrete(false)`: the
+            // `.all` can raise a QuantifierError, so the `&&` simplifier keeps
+            // the node (behavioural guard for `can_error_assuming_well_formed`,
+            // review Finding 1). If `All` wrongly reported it cannot error, this
+            // would collapse to `false`.
+            let schema = anyall_schema();
+            let Ok(Context::Value(context)) =
+                Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+            else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid("E"), // resource eid unknown => receiver residual
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            // Kept as `<All> && false`, not simplified to `false`.
+            assert_snapshot!(
+                interpret_typed_str_to_str(&eval, r#"resource.recs.all(it.n >= 1) && false"#, &schema),
+                @"resource.recs.all(!(it.n < 1)) && false"
+            );
+        }
+
+        #[test]
+        fn concrete_receiver_residual_predicate_keeps_node() {
+            // Concrete receiver, but the predicate reads an UNKNOWN request
+            // attribute (`resource.unknownish` via a residual sub-term): under
+            // D-80 option A, a residual per-element predicate conservatively
+            // keeps the whole node residual (7.3/7.4). Here the predicate
+            // compares `it` to `resource`'s (unknown) identity through `in`,
+            // which stays residual while `context.recs` is concrete.
+            // We keep the receiver concrete and make the predicate residual by
+            // referencing the unknown principal.
+            let schema = parse_schema(
+                r#"entity E in E;
+                   action a appliesTo {
+                     principal: E, resource: E, context: { es: Set<E> }
+                   };"#,
+            );
+            let Ok(Context::Value(context)) =
+                Context::from_json_value(serde_json::json!({ "es": [ {"__entity":{"type":"E","id":"x"}} ] }))
+            else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid("E"), // principal unknown
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid(r#"E::"r""#),
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            // `it in principal` with unknown principal => per-element predicate
+            // residual => whole node retained with the concrete receiver.
+            assert_snapshot!(
+                interpret_typed_str_to_str(&eval, r#"context.es.all(it in principal)"#, &schema),
+                @r#"[E::"x"].all(it in principal)"#
+            );
+        }
+
+        // --- W4: central stray-`it` backstop (D-32) ---
+
+        // --- Finding 2: reauthorization-parity for the residual soundness invariant (7.2) ---
+
+        #[test]
+        fn reauthorization_parity_residual_all() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // Produce a residual `All` with a genuinely UNKNOWN receiver
+            // (`resource.recs`, resource eid unknown), round-trip it through
+            // `From<Residual> for Expr`, then COMPLETE the receiver with several
+            // concrete sets and assert the completed residual's concrete
+            // evaluation equals full concrete evaluation of the ORIGINAL
+            // expression on the same input (the req-7.2 soundness invariant).
+            let schema = anyall_schema();
+            let src = r#"resource.recs.all(it.n >= 1)"#;
+
+            // 1. TPE with unknown resource => residual, then Expr::from.
+            let Ok(Context::Value(ctx)) =
+                Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+            else {
+                panic!("concrete context")
+            };
+            let preq = PartialRequest::new(
+                parse_partial_euid(r#"E::"p""#),
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid("E"), // resource unknown
+                Some(ctx),
+                &schema,
+            )
+            .unwrap();
+            let peval = Evaluator {
+                request: &preq,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            let residual = peval
+                .interpret_expr(&parse_typed_expr(src, peval.request, &schema, &SlotEnv::new()))
+                .unwrap();
+            assert!(residual.is_partial(), "receiver unknown => residual All");
+            let roundtripped: ast::Expr = residual.into();
+            let original: ast::Expr = src.parse().unwrap();
+
+            // 2. Complete the receiver with >=4 concrete sets and compare the
+            // concrete evaluation of the round-tripped residual against full
+            // evaluation of the original. The erroring set places the error
+            // AFTER a false element to also exercise req 2.8.
+            let cases: Vec<(&str, serde_json::Value)> = vec![
+                ("all_true", serde_json::json!([{"n": 1}, {"n": 2}])),
+                ("has_false", serde_json::json!([{"n": 0}, {"n": 2}])),
+                ("empty", serde_json::json!([])),
+                ("false_then_ok", serde_json::json!([{"n": 0}, {"n": 5}])),
+            ];
+            let exts = Extensions::all_available();
+            for (name, recs) in cases {
+                let parser: crate::entities::EntityJsonParser<'_, '_> =
+                    crate::entities::EntityJsonParser::new(
+                        None,
+                        exts,
+                        crate::entities::TCComputation::ComputeNow,
+                    );
+                let entities = parser
+                    .from_json_value(serde_json::json!([
+                        { "uid": {"type":"E","id":"r"}, "attrs": { "recs": recs }, "parents": [] }
+                    ]))
+                    .unwrap();
+                let ctx = Context::from_json_value(
+                    serde_json::json!({"nums":[],"strs":[],"recs":[]}),
+                )
+                .unwrap();
+                let req = Request::new_unchecked(
+                    EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                    Some(ctx),
+                );
+                let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+                let got = ev.interpret(&roundtripped, &SlotEnv::new());
+                let want = ev.interpret(&original, &SlotEnv::new());
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => assert_eq!(g, w, "case {name}: value mismatch"),
+                    (Err(_), Err(_)) => {} // both error (QuantifierError image)
+                    _ => panic!("case {name}: residual {got:?} vs original {want:?} disagree"),
+                }
+            }
+
+            // Error-after-false: an overflow predicate. Element {n:0} => `0>=1`
+            // false (no error); element {n:i64::MAX} => `>=1` true then
+            // `n + i64::MAX` overflows => QuantifierError. The error outranks the
+            // earlier false (req 2.8), end-to-end through the round-tripped
+            // residual, and must match full evaluation of the original.
+            let src_err = r#"resource.recs.all(it.n >= 1 && it.n + 9223372036854775807 >= 0)"#;
+            let residual_err = peval
+                .interpret_expr(&parse_typed_expr(src_err, peval.request, &schema, &SlotEnv::new()))
+                .unwrap();
+            let rt_err: ast::Expr = residual_err.into();
+            let orig_err: ast::Expr = src_err.parse().unwrap();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"r"},
+                      "attrs": { "recs": [{"n": 0_i64}, {"n": 9223372036854775807_i64}] },
+                      "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({"nums":[],"strs":[],"recs":[]}))
+                .unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+            let got = ev.interpret(&rt_err, &SlotEnv::new());
+            let want = ev.interpret(&orig_err, &SlotEnv::new());
+            // Both must error (QuantifierError), proving no short-circuit on the
+            // earlier false and residual/original agreement.
+            assert!(
+                got.is_err() && want.is_err(),
+                "false-then-error: residual {got:?} vs original {want:?} must both error"
+            );
+        }
+
+        #[test]
+        fn stray_it_is_rejected_by_tpe_backstop() {
+            use crate::ast::Unknown;
+            use crate::expr_builder::ExprBuilder as _;
+            use crate::tpe::err::ExprToResidualError;
+            use cool_asserts::assert_matches;
+            // Hand-build a typed expr that is a stray `it` sentinel OUTSIDE any
+            // predicate, bypassing the parser's `reject_stray_it` entry guard,
+            // to prove the TPE backstop (D-32) catches it. The sentinel is the
+            // reserved `IT_SENTINEL` unknown.
+            let b: ExprBuilder<Option<Type>> =
+                ExprBuilder::with_data(Some(Type::primitive_boolean()));
+            let stray = b.unknown(Unknown::new_untyped(crate::ast::IT_SENTINEL));
+            assert_matches!(
+                Residual::try_from_typed_expr(&stray, &SlotEnv::new()),
+                Err(ExprToResidualError::StrayIt(_))
+            );
+        }
+
+        // --- Finding 3: the TPE concrete fold is RE-IMPLEMENTED over `Residual`
+        // (not delegating to the Phase-3 `evaluator.rs:780` arm), so the two
+        // folds are independent paths that this test pins to the same answers.
+        // Each case is a fully-concrete `.all` driven through BOTH the Phase-3
+        // concrete evaluator and the TPE concrete-receiver fold; the two must
+        // agree on true/false/error (incl. the req-2.8 ordering cases). ---
+        #[test]
+        fn concrete_fold_matches_phase3_evaluator() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            #[derive(PartialEq, Debug)]
+            enum Verdict {
+                True,
+                False,
+                Error,
+            }
+            // Every case receives `context.nums` (Set<Long>). The predicate and
+            // the set together exercise true/false/empty/error and the two
+            // error-ordering cases (false-then-error, error-then-false).
+            let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+                ("all_true", "it >= 8000", serde_json::json!([8000_i64, 9000_i64])),
+                ("all_false", "it >= 8000", serde_json::json!([1_i64, 2_i64])),
+                ("empty", "it >= 8000", serde_json::json!([])),
+                ("single_true", "it >= 8000", serde_json::json!([8000_i64])),
+                ("single_false", "it >= 8000", serde_json::json!([1_i64])),
+                ("two_false", "it >= 8000", serde_json::json!([1_i64, 2_i64])),
+                // overflow => every element errors
+                ("overflow", "it + 9223372036854775807 >= 0", serde_json::json!([1_i64, 2_i64])),
+                // false element FIRST, erroring element AFTER (req 2.8)
+                (
+                    "false_then_error",
+                    "it >= 8000 && it + 9223372036854775807 >= 0",
+                    serde_json::json!([0_i64, 9223372036854775807_i64]),
+                ),
+                // erroring element FIRST, false element AFTER (req 2.8)
+                (
+                    "error_then_false",
+                    "it + 9223372036854775807 >= 0 && it >= 8000",
+                    serde_json::json!([9223372036854775807_i64, 0_i64]),
+                ),
+            ];
+            let exts = Extensions::all_available();
+            for (name, pred, nums) in cases {
+                let src = format!("context.nums.all({pred})");
+                let ctx_json = serde_json::json!({ "nums": nums, "strs": [], "recs": [] });
+
+                // --- TPE concrete-receiver fold ---
+                let Ok(Context::Value(ctx)) = Context::from_json_value(ctx_json.clone()) else {
+                    panic!("concrete context")
+                };
+                let preq = PartialRequest::new(
+                    parse_partial_euid(r#"E::"p""#),
+                    r#"Action::"a""#.parse().unwrap(),
+                    parse_partial_euid(r#"E::"r""#),
+                    Some(ctx),
+                    &anyall_schema(),
+                )
+                .unwrap();
+                let peval = Evaluator {
+                    request: &preq,
+                    entities: &PartialEntities::new(),
+                    extensions: exts,
+                };
+                let tpe = peval
+                    .interpret_expr(&parse_typed_expr(
+                        &src,
+                        peval.request,
+                        &anyall_schema(),
+                        &SlotEnv::new(),
+                    ))
+                    .unwrap();
+                let tpe_verdict = if tpe.is_true() {
+                    Verdict::True
+                } else if tpe.is_false() {
+                    Verdict::False
+                } else if tpe.is_error() {
+                    Verdict::Error
+                } else {
+                    panic!("case {name}: TPE did not fully fold a concrete receiver: {tpe:?}")
+                };
+
+                // --- Phase-3 concrete evaluator ---
+                let ctx = Context::from_json_value(ctx_json).unwrap();
+                let req = Request::new_unchecked(
+                    EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                    Some(ctx),
+                );
+                let entities = crate::entities::Entities::new();
+                let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+                let expr: ast::Expr = src.parse().unwrap();
+                let concrete_verdict = match ev.interpret(&expr, &SlotEnv::new()) {
+                    Ok(v) => match v.get_as_bool() {
+                        Ok(true) => Verdict::True,
+                        Ok(false) => Verdict::False,
+                        Err(_) => Verdict::Error,
+                    },
+                    Err(_) => Verdict::Error,
+                };
+
+                assert_eq!(
+                    tpe_verdict, concrete_verdict,
+                    "case {name}: TPE fold and Phase-3 evaluator disagree"
+                );
+            }
+        }
     }
 }

@@ -144,12 +144,15 @@ pub enum ExprToResidualError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     ErrorNotSupported(#[from] ErrorNotSupportedError),
-    /// Expression contains a `.all`/`.any` set operator, not yet supported in
-    /// residuals (typed partial evaluation of `.all`/`.any` lands in Phase 6.5).
+    /// Expression contains a stray `it` (the reserved `.all`/`.any` element
+    /// keyword) outside any predicate. Central TPE backstop for D-32 — the
+    /// parser already rejects this at every entry point
+    /// (`reject_stray_it`/req 1.6); this guard catches a stray sentinel that
+    /// reaches TPE through any future entry point that forgot the check.
     #[cfg(feature = "anyall")]
     #[error(transparent)]
     #[diagnostic(transparent)]
-    AllNotSupported(#[from] AllNotSupportedError),
+    StrayIt(#[from] StrayItError),
 }
 
 /// Error thrown when expression is missing type annotation
@@ -170,14 +173,16 @@ pub struct UnknownNotSupportedError;
 #[error("expression contains an error node, which is not supported in residuals")]
 pub struct ErrorNotSupportedError;
 
-/// Error thrown when expression contains a `.all`/`.any` set operator, which is
-/// not yet supported in residuals. Typed partial evaluation of `.all`/`.any`
-/// is implemented in Phase 6.5; until then the TPE translation rejects it
-/// conservatively rather than silently mishandling it.
+/// Error thrown when a stray `it` (the reserved `.all`/`.any` element keyword)
+/// reaches TPE outside any predicate. This is the central backstop for D-32:
+/// the parser rejects a stray `it` at each entry point via `reject_stray_it`
+/// (requirement 1.6), and TPE — the common choke point that turns typed
+/// expressions into residuals — rejects it again so a future entry point that
+/// forgot the check cannot let the sentinel residualize as an unknown.
 #[cfg(feature = "anyall")]
 #[derive(Debug, Error, Diagnostic)]
-#[error("expression contains a `.all`/`.any` set operator, which is not yet supported in residuals")]
-pub struct AllNotSupportedError;
+#[error("expression contains a stray `it` outside any `.all`/`.any` predicate")]
+pub struct StrayItError;
 
 /// Error when a request was expected to be concrete
 #[derive(Debug, Error, Diagnostic)]

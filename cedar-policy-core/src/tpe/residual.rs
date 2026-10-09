@@ -26,7 +26,7 @@ use crate::evaluator::evaluation_errors;
 #[cfg(feature = "tolerant-ast")]
 use crate::tpe::err::ErrorNotSupportedError;
 #[cfg(feature = "anyall")]
-use crate::tpe::err::AllNotSupportedError;
+use crate::tpe::err::StrayItError;
 use crate::tpe::err::{ExprToResidualError, MissingTypeAnnotationError, UnknownNotSupportedError};
 use crate::validator::types::Type;
 use crate::{
@@ -168,6 +168,14 @@ impl Residual {
                 ResidualKind::Record(attrs) => attrs
                     .iter()
                     .any(|(_, e)| e.can_error_assuming_well_formed()),
+                // A quantifier can produce a `QuantifierError` whenever a
+                // per-element predicate errors or is non-boolean, so `.all` is
+                // itself a runtime-error source regardless of the receiver
+                // (like `GetTag`/arithmetic). Reporting `false` here would let a
+                // downstream simplification drop a possibly-erroring `.all`
+                // (D-80, risk R2).
+                #[cfg(feature = "anyall")]
+                ResidualKind::All { .. } => true,
             },
         }
     }
@@ -289,13 +297,28 @@ impl Residual {
                     .into());
                 }
             },
-            ast::ExprKind::Unknown(_) => return Err(UnknownNotSupportedError.into()),
-            // Phase 6.5 implements typed partial evaluation of `.all`/`.any`
-            // (concrete receiver -> evaluate; residual receiver -> emit a
-            // residual All). Until then the translation rejects it conservatively
-            // rather than silently mishandling it.
+            ast::ExprKind::Unknown(_) => {
+                // Central D-32 backstop: a stray `it` (the reserved element
+                // keyword, represented as an `IT_SENTINEL` unknown) reaching TPE
+                // outside a predicate is rejected explicitly here, agreeing with
+                // the parser's `reject_stray_it` (req 1.6). Inside a predicate
+                // `it` is a `PredExprKind::Item`, never an `Expr` unknown, so
+                // any sentinel the TPE walker sees is genuinely stray.
+                #[cfg(feature = "anyall")]
+                if ast::is_it_sentinel(expr) {
+                    return Err(StrayItError.into());
+                }
+                return Err(UnknownNotSupportedError.into());
+            }
+            // Phase 6.5 (D-80): translate `.all`/`.any` to a residual `All`
+            // node. The receiver is residualized recursively; the predicate
+            // carries no `Unknown`/`Slot` (D-18), so it is stored raw. TPE
+            // folding of a concrete receiver happens in `Evaluator::interpret`.
             #[cfg(feature = "anyall")]
-            ast::ExprKind::All { .. } => return Err(AllNotSupportedError.into()),
+            ast::ExprKind::All { expr, pred } => ResidualKind::All {
+                expr: Arc::new(Self::try_from_typed_expr(expr.as_ref(), env)?),
+                pred: Arc::new(pred.as_ref().with_default_data()),
+            },
             #[cfg(feature = "tolerant-ast")]
             ast::ExprKind::Error { .. } => {
                 return Err(ErrorNotSupportedError.into());
@@ -303,6 +326,117 @@ impl Residual {
         };
 
         Ok(Residual::Partial { kind, ty })
+    }
+}
+
+#[cfg(feature = "anyall")]
+impl Residual {
+    /// Convert an **untyped** expression (an `.all` predicate instantiated for
+    /// one concrete set element) into a residual, assigning `placeholder_ty` to
+    /// every produced node.
+    ///
+    /// This is used only inside the TPE `.all` fold, on predicates whose `it`
+    /// has already been replaced by a concrete element `Value`. The result is
+    /// ephemeral — it is interpreted immediately and either folds to a boolean
+    /// or is discarded (the whole quantifier node residualizes). Because the
+    /// fold inspects only booleans / errors / residual-ness, the exact `ty` is
+    /// irrelevant to the result, so a single `placeholder_ty` (the quantifier's
+    /// own `Bool` type) is propagated throughout.
+    ///
+    /// INVARIANT: a `PredExpr` is set-free and non-nested and has no
+    /// `Slot`/`Unknown`/`All`/`Error` node, and `it` is already substituted, so
+    /// this conversion is total.
+    pub(crate) fn from_untyped_expr(expr: &Expr, placeholder_ty: &Type) -> Self {
+        let ty = placeholder_ty.clone();
+        // Guard against stack overflow on deep predicates, mirroring
+        // `tpe::evaluator::Evaluator::interpret` and the concrete evaluator
+        // (review round 2 NIT; unreachable today — the parser overflows first).
+        if crate::evaluator::stack_size_check().is_err() {
+            return Residual::Error(ty);
+        }
+        let recur = |e: &Expr| Arc::new(Self::from_untyped_expr(e, placeholder_ty));
+        let kind = match expr.expr_kind() {
+            ast::ExprKind::Lit(lit) => {
+                return Residual::Concrete {
+                    value: Value::new(lit.clone(), None),
+                    ty,
+                };
+            }
+            ast::ExprKind::Var(var) => ResidualKind::Var(*var),
+            ast::ExprKind::If {
+                test_expr,
+                then_expr,
+                else_expr,
+            } => ResidualKind::If {
+                test_expr: recur(test_expr.as_ref()),
+                then_expr: recur(then_expr.as_ref()),
+                else_expr: recur(else_expr.as_ref()),
+            },
+            ast::ExprKind::And { left, right } => ResidualKind::And {
+                left: recur(left.as_ref()),
+                right: recur(right.as_ref()),
+            },
+            ast::ExprKind::Or { left, right } => ResidualKind::Or {
+                left: recur(left.as_ref()),
+                right: recur(right.as_ref()),
+            },
+            ast::ExprKind::UnaryApp { op, arg } => ResidualKind::UnaryApp {
+                op: *op,
+                arg: recur(arg.as_ref()),
+            },
+            ast::ExprKind::BinaryApp { op, arg1, arg2 } => ResidualKind::BinaryApp {
+                op: *op,
+                arg1: recur(arg1.as_ref()),
+                arg2: recur(arg2.as_ref()),
+            },
+            ast::ExprKind::ExtensionFunctionApp { fn_name, args } => {
+                ResidualKind::ExtensionFunctionApp {
+                    fn_name: fn_name.clone(),
+                    args: Arc::new(args.iter().map(|e| Self::from_untyped_expr(e, placeholder_ty)).collect()),
+                }
+            }
+            ast::ExprKind::GetAttr { expr, attr } => ResidualKind::GetAttr {
+                expr: recur(expr.as_ref()),
+                attr: attr.clone(),
+            },
+            ast::ExprKind::HasAttr { expr, attr } => ResidualKind::HasAttr {
+                expr: recur(expr.as_ref()),
+                attr: attr.clone(),
+            },
+            ast::ExprKind::ExtHasAttr { expr, attrs } => ResidualKind::ExtHasAttr {
+                expr: recur(expr.as_ref()),
+                attrs: attrs.clone(),
+            },
+            ast::ExprKind::Like { expr, pattern } => ResidualKind::Like {
+                expr: recur(expr.as_ref()),
+                pattern: pattern.clone(),
+            },
+            ast::ExprKind::Is { expr, entity_type } => ResidualKind::Is {
+                expr: recur(expr.as_ref()),
+                entity_type: entity_type.clone(),
+            },
+            ast::ExprKind::Set(elements) => {
+                ResidualKind::Set(Arc::new(
+                    elements.iter().map(|e| Self::from_untyped_expr(e, placeholder_ty)).collect(),
+                ))
+            }
+            ast::ExprKind::Record(map) => ResidualKind::Record(Arc::new(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from_untyped_expr(v, placeholder_ty)))
+                    .collect(),
+            )),
+            // A `PredExpr` cannot contain a slot, unknown, nested `.all`, or an
+            // error node, and `it` has already been substituted by a concrete
+            // value, so these are unreachable for an instantiated predicate.
+            ast::ExprKind::Slot(_) | ast::ExprKind::Unknown(_) => {
+                return Residual::Error(ty);
+            }
+            #[cfg(feature = "anyall")]
+            ast::ExprKind::All { .. } => return Residual::Error(ty),
+            #[cfg(feature = "tolerant-ast")]
+            ast::ExprKind::Error { .. } => return Residual::Error(ty),
+        };
+        Residual::Partial { kind, ty }
     }
 }
 
@@ -409,6 +543,19 @@ pub enum ResidualKind {
     Set(Arc<Vec<Residual>>),
     /// Anonymous record (whose elements may be arbitrary expressions)
     Record(Arc<BTreeMap<SmolStr, Residual>>),
+    /// Non-nested bounded set quantifier `expr.all(pred)` (and its `.any`
+    /// lowering `!expr.all(!pred)`). The receiver `expr` is a residual; the
+    /// set-free predicate `pred` over the element keyword `it` is stored raw
+    /// (predicates carry no `Unknown`/`Slot`, D-18). Produced by TPE when the
+    /// receiver stays residual, or when a concrete receiver has a per-element
+    /// predicate that itself stays residual (D-80, req 7.2/7.4).
+    #[cfg(feature = "anyall")]
+    All {
+        /// Receiver; must evaluate to a Set.
+        expr: Arc<Residual>,
+        /// Set-free, non-nested predicate over the current element `it`.
+        pred: Arc<ast::PredExpr>,
+    },
 }
 
 impl ResidualKind {
@@ -463,8 +610,33 @@ impl ResidualKind {
                 }
                 uids
             }
+            // The predicate may reference literal entity UIDs (e.g.
+            // `it == User::"admin"`); the reauthorization entity loader relies
+            // on `all_literal_uids`, so we must surface them (D-80, risk R3).
+            #[cfg(feature = "anyall")]
+            ResidualKind::All { expr, pred } => {
+                let mut uids = expr.all_literal_uids();
+                uids.extend(pred_literal_uids(pred));
+                uids
+            }
         }
     }
+}
+
+/// All literal entity UIDs syntactically referenced by a predicate. Mirrors the
+/// Lean `PredExpr.litUIDs` walk; used to extend `ResidualKind::All`'s
+/// `all_literal_uids` so reauthorization loads every entity a `.all` predicate
+/// names.
+#[cfg(feature = "anyall")]
+fn pred_literal_uids(pred: &ast::PredExpr) -> HashSet<EntityUID> {
+    use crate::ast::PredExprKind;
+    let mut uids = HashSet::new();
+    for sub in pred.subexpressions() {
+        if let PredExprKind::Lit(Literal::EntityUID(uid)) = sub.expr_kind() {
+            uids.insert(uid.as_ref().clone());
+        }
+    }
+    uids
 }
 
 impl Residual {
@@ -571,6 +743,10 @@ impl From<Residual> for Expr {
                         builder.unary_app(op, arg.as_ref().clone().into())
                     }
                     ResidualKind::Var(v) => builder.var(v),
+                    #[cfg(feature = "anyall")]
+                    ResidualKind::All { expr, pred } => {
+                        builder.all(expr.as_ref().clone().into(), pred.as_ref().clone())
+                    }
                 }
             }
             Residual::Concrete { value, .. } => value.into(),
@@ -870,5 +1046,62 @@ pub(super) mod test {
         assert_eq_expr(
             r#"(if principal.foo then {a: User::"alice", b: true} else {a: User::"jane", b: false}).a.foo"#,
         );
+    }
+
+    #[cfg(feature = "anyall")]
+    mod anyall {
+        use super::*;
+        use crate::tpe::residual::ResidualKind;
+        use similar_asserts::assert_eq;
+
+        #[test]
+        fn all_to_residual_roundtrips() {
+            // `.all` translates to a `ResidualKind::All`, and `Expr::from`
+            // round-trips it back to a shape-equal `Expr::all` (W1, req 7.2).
+            let r = parse_residual(r#"principal.set.all(it == "x")"#);
+            assert_matches!(
+                &r,
+                Residual::Partial {
+                    kind: ResidualKind::All { .. },
+                    ..
+                }
+            );
+            // `.all` prints/round-trips in its lowered normal form.
+            assert_eq_expr(r#"principal.set.all(it == "x")"#);
+            // `.any` lowers to `!all(!p)`.
+            assert_eq_expr(r#"principal.set.any(it == "x")"#);
+        }
+
+        #[test]
+        fn all_literal_uids_includes_predicate_literals() {
+            // The predicate may name literal entity UIDs; `all_literal_uids`
+            // must surface both the receiver's and the predicate's (W1, R3).
+            let r = parse_residual(r#"[User::"alice"].all(it == User::"bob")"#);
+            assert_eq!(
+                r.all_literal_uids(),
+                HashSet::from([
+                    r#"User::"alice""#.parse().unwrap(),
+                    r#"User::"bob""#.parse().unwrap(),
+                ])
+            );
+        }
+
+        #[test]
+        fn all_can_error_assuming_well_formed() {
+            // A quantifier can raise a `QuantifierError`, so a residual `All`
+            // MUST report it can error — otherwise the `&&`/`||` simplifier
+            // would drop a possibly-erroring `.all` (PLAN R2 / review Finding
+            // 1). Guards the `=> true` arm in `can_error_assuming_well_formed`.
+            assert_eq!(
+                parse_residual(r#"principal.set.all(it == "x")"#).can_error_assuming_well_formed(),
+                true
+            );
+            // Still true even when the receiver itself cannot error.
+            assert_eq!(
+                parse_residual(r#"[User::"a"].all(it == User::"b")"#)
+                    .can_error_assuming_well_formed(),
+                true
+            );
+        }
     }
 }
