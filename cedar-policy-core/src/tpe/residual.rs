@@ -348,6 +348,12 @@ impl Residual {
     /// this conversion is total.
     pub(crate) fn from_untyped_expr(expr: &Expr, placeholder_ty: &Type) -> Self {
         let ty = placeholder_ty.clone();
+        // Guard against stack overflow on deep predicates, mirroring
+        // `tpe::evaluator::Evaluator::interpret` and the concrete evaluator
+        // (review round 2 NIT; unreachable today — the parser overflows first).
+        if crate::evaluator::stack_size_check().is_err() {
+            return Residual::Error(ty);
+        }
         let recur = |e: &Expr| Arc::new(Self::from_untyped_expr(e, placeholder_ty));
         let kind = match expr.expr_kind() {
             ast::ExprKind::Lit(lit) => {
