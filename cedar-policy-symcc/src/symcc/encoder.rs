@@ -99,6 +99,14 @@ pub enum EncodeError {
     /// Expecting a record type.
     #[error("expecting a record type, got {0:?}")]
     ExpectRecord(TermType),
+    /// `set.all` (feature `anyall`) term reached the encoder, which does not yet
+    /// emit the two-`set.filter` `HO_ALL` encoding. The Rust `.all` compile arm
+    /// (Phase 6 W3) builds the term; the byte-for-byte encoder emission (and the
+    /// `HO_ALL` logic switch) land with the SymCC differential (Phase 6 W8),
+    /// gated on Phase 5B re-landing and D-74.
+    #[cfg(feature = "anyall")]
+    #[error("SMT encoding of `set.all` is not yet wired (Phase 6 W8)")]
+    SetAllNotEncoded,
     /// Missing type encoding.
     #[error("missing type encoding for {0:?}")]
     MissingTypeEncoding(TermType),
@@ -567,6 +575,39 @@ impl<S: tokio::io::AsyncWrite + Unpin + Send> Encoder<'_, S> {
                 }
             }
             Term::App { op, args, .. } => {
+                #[cfg(feature = "anyall")]
+                if matches!(op, Op::SetAll) {
+                    // D-52 tri-valued `set.filter` encoding (HO_ALL), mirroring
+                    // Lean's `Encoder.lean` `set.all` arm:
+                    //   ite (not (set.filter (lambda ((!anyall!it T)) ERR) S = empty))
+                    //       none
+                    //       (some (set.filter (lambda ((!anyall!it T)) P) S = S))
+                    #[expect(clippy::indexing_slicing, reason = "set.all always has 3 args")]
+                    let (set_t, pred_t, err_t) = (&args[0], &args[1], &args[2]);
+                    let elem_ty = match set_t.type_of() {
+                        TermType::Set { ty } => std::sync::Arc::unwrap_or_clone(ty),
+                        _ => return Err(EncodeError::SetAllNotEncoded),
+                    };
+                    let elem_ty_enc = self.encode_type(&elem_ty).await?;
+                    let s_enc = self.encode_term(set_t).await?;
+                    let pred_enc = self.encode_term_inline(pred_t).await?;
+                    let err_enc = self.encode_term_inline(err_t).await?;
+                    let val_filter = format_smolstr!(
+                        "(set.filter (lambda ((!anyall!it {elem_ty_enc})) {pred_enc}) {s_enc})"
+                    );
+                    let err_filter = format_smolstr!(
+                        "(set.filter (lambda ((!anyall!it {elem_ty_enc})) {err_enc}) {s_enc})"
+                    );
+                    let v = format_smolstr!("(= {val_filter} {s_enc})");
+                    let e = format_smolstr!(
+                        "(not (= {err_filter} (as set.empty (Set {elem_ty_enc}))))"
+                    );
+                    let enc = self
+                        .define_term(&ty_enc, &format_smolstr!("(ite {e} (as none {ty_enc}) (some {v}))"))
+                        .await?;
+                    self.terms.insert(t.clone(), enc.clone());
+                    return Ok(enc);
+                }
                 let mut encoded_terms = Vec::with_capacity(args.len());
                 for arg in args.iter() {
                     encoded_terms.push(self.encode_term(arg).await?);
@@ -577,6 +618,119 @@ impl<S: tokio::io::AsyncWrite + Unpin + Send> Encoder<'_, S> {
         };
         self.terms.insert(t.clone(), enc.clone());
         Ok(enc)
+    }
+
+    /// Encode a Term *inline* (not in A-normal form) for use inside a
+    /// `set.filter` lambda body (the `set.all` encoding, feature `anyall`,
+    /// D-52/D-53). Mirrors Lean `Encoder.encodeTermInline`. Subterms that do NOT
+    /// mention the reserved bound variable `!anyall!it` are closed w.r.t. the
+    /// binder and delegated to the ANF `encode_term` (returning a top-level id,
+    /// valid inside the lambda); only subterms that mention it are inlined.
+    #[cfg(feature = "anyall")]
+    #[async_recursion]
+    pub async fn encode_term_inline(&mut self, t: &Term) -> Result<SmolStr> {
+        if !mentions_anyall_it(t) {
+            return self.encode_term(t).await;
+        }
+        match t {
+            Term::Var(v) => {
+                if v.id == "!anyall!it" {
+                    Ok(SmolStr::new_static("!anyall!it"))
+                } else {
+                    self.encode_term(t).await
+                }
+            }
+            Term::Some(inner) => {
+                Ok(format_smolstr!("(some {})", self.encode_term_inline(inner).await?))
+            }
+            Term::Set { elts, elts_ty } => {
+                let set_ty_enc = self.encode_type(&TermType::set_of(elts_ty.clone())).await?;
+                if elts.is_empty() {
+                    Ok(format_smolstr!("(as set.empty {set_ty_enc})"))
+                } else {
+                    let mut encs = Vec::with_capacity(elts.len());
+                    for e in elts.iter() {
+                        encs.push(self.encode_term_inline(e).await?);
+                    }
+                    Ok(format_smolstr!(
+                        "(set.insert {} (as set.empty {set_ty_enc}))",
+                        encs.into_iter().join(" ")
+                    ))
+                }
+            }
+            Term::App { op, args, .. } => {
+                let args_slice = args.as_slice();
+                match (op, args_slice) {
+                    (Op::RecordGet(a), [r]) => {
+                        let r_enc = self.encode_term_inline(r).await?;
+                        let r_ty = r.type_of();
+                        let r_id = match self.types.get(&r_ty) {
+                            Some(id) => id.clone(),
+                            None => return Err(EncodeError::MissingTypeEncoding(r_ty.clone())),
+                        };
+                        let a_id = Self::index_of_attr(a, &r_ty)?;
+                        Ok(format_smolstr!("({} {r_enc})", record_attr_id(&r_id, a_id)))
+                    }
+                    (Op::StringLike(p), [a]) => {
+                        let a_enc = self.encode_term_inline(a).await?;
+                        let p_enc = encode_pattern(p).ok_or_else(|| {
+                            EncodeError::EncodePatternFailed(p.clone())
+                        })?;
+                        Ok(format_smolstr!("(str.in_re {a_enc} {p_enc})"))
+                    }
+                    (Op::OptionGet, [a]) => {
+                        Ok(format_smolstr!("(val {})", self.encode_term_inline(a).await?))
+                    }
+                    (Op::Uuf(f), [a]) => {
+                        let f_enc = self.encode_uuf(f).await?;
+                        Ok(format_smolstr!("({f_enc} {})", self.encode_term_inline(a).await?))
+                    }
+                    (Op::Ext(xop), [a]) => {
+                        Ok(format_smolstr!(
+                            "({} {})",
+                            encode_ext_op(xop),
+                            self.encode_term_inline(a).await?
+                        ))
+                    }
+                    (Op::Eq, [a, b]) => {
+                        let a_enc = self.encode_term_inline(a).await?;
+                        let b_enc = self.encode_term_inline(b).await?;
+                        Ok(format_smolstr!("(= {a_enc} {b_enc})"))
+                    }
+                    (Op::ZeroExtend(n), [a]) => {
+                        Ok(format_smolstr!(
+                            "((_ zero_extend {n}) {})",
+                            self.encode_term_inline(a).await?
+                        ))
+                    }
+                    _ => {
+                        let mut encs = Vec::with_capacity(args.len());
+                        for a in args.iter() {
+                            encs.push(self.encode_term_inline(a).await?);
+                        }
+                        Ok(format_smolstr!("({} {})", encode_op(op), encs.into_iter().join(" ")))
+                    }
+                }
+            }
+            // `prim`/`none` never mention the bound var (handled by the fast path
+            // above); `record` with the bound var falls here only if a record
+            // literal mentions `it`, which the set-free predicate fragment does
+            // produce (a record of `it`-attributes) — encode it inline.
+            Term::Record(ats) => {
+                let r_ty = t.type_of();
+                let r_ty_enc = self.encode_type(&r_ty).await?;
+                if ats.is_empty() {
+                    Ok(r_ty_enc)
+                } else {
+                    let mut encs = Vec::with_capacity(ats.len());
+                    for v in ats.values() {
+                        encs.push(self.encode_term_inline(v).await?);
+                    }
+                    Ok(format_smolstr!("({r_ty_enc} {})", encs.into_iter().join(" ")))
+                }
+            }
+            Term::Prim(_) | Term::None(_) => self.encode_term(t).await,
+        }
     }
 
     /// Once you've generated `Asserts` with one of the functions in verifier.rs, you
@@ -706,6 +860,22 @@ fn encode_ext_op(ext_op: &ExtOp) -> &'static str {
         ExtOp::DatetimeOfBitVec => "Datetime",
         ExtOp::DurationVal => "durationVal",
         ExtOp::DurationOfBitVec => "Duration",
+    }
+}
+
+/// Does the term mention the reserved `.all` bound element variable
+/// `!anyall!it`? Mirrors Lean `Term.mentionsAnyAllIt`. A subterm that does not
+/// is closed w.r.t. the `set.filter` binder and can be ANF-lifted (encoded with
+/// `encode_term`); only subterms that do must be encoded inline (D-53).
+#[cfg(feature = "anyall")]
+fn mentions_anyall_it(t: &Term) -> bool {
+    match t {
+        Term::Var(v) => v.id == "!anyall!it",
+        Term::Prim(_) | Term::None(_) => false,
+        Term::Some(inner) => mentions_anyall_it(inner),
+        Term::Set { elts, .. } => elts.iter().any(mentions_anyall_it),
+        Term::Record(ats) => ats.values().any(mentions_anyall_it),
+        Term::App { args, .. } => args.iter().any(mentions_anyall_it),
     }
 }
 
@@ -1074,5 +1244,166 @@ mod deep_extended_has_chain_tests {
         let n_4 = smt_at_4.matches("define-fun").count();
         // Size increases linearly, not exponentially
         assert_eq!(n_3 - n_2, n_4 - n_3);
+    }
+}
+
+#[cfg(all(test, feature = "anyall"))]
+#[expect(clippy::panic, reason = "unit tests")]
+mod anyall_encoder_tests {
+    use std::str::FromStr;
+
+    use cedar_policy::{RequestEnv, Schema};
+
+    use super::*;
+    use crate::symcc::compiler::compile;
+    use crate::symcc::env::SymEnv;
+
+    fn sym_env() -> SymEnv {
+        let schema = Schema::from_cedarschema_str(
+            r#"
+            entity User;
+            entity Thing;
+            action View appliesTo {
+                principal: [User],
+                resource: [Thing],
+                context: { ports: Set<Long> }
+            };
+            "#,
+        )
+        .unwrap()
+        .0;
+        let req = RequestEnv::new(
+            "User".parse().unwrap(),
+            "Action::\"View\"".parse().unwrap(),
+            "Thing".parse().unwrap(),
+        );
+        SymEnv::new(&schema, &req).expect("malformed sym env")
+    }
+
+    async fn encode_expr(s: &str) -> String {
+        let env = sym_env();
+        let term = compile(&cedar_policy_core::ast::Expr::from_str(s).unwrap(), &env).unwrap();
+        let mut encoder = Encoder::new(&env, Vec::<u8>::new()).unwrap();
+        encoder.encode_term(&term).await.unwrap();
+        String::from_utf8(encoder.script).unwrap()
+    }
+
+    // A symbolic `.all` emits the tri-valued two-`set.filter` encoding (D-52):
+    // a value filter `(= (set.filter (lambda ((!anyall!it ...)) P) S) S)` and an
+    // error filter `(not (= (set.filter (lambda ...) ERR) (as set.empty ...)))`,
+    // combined `(ite err none (some val))`. We assert the structural pieces
+    // rather than a full snapshot (ids/types are schema-dependent), which is
+    // enough to prove the HO `set.filter` lambdas are emitted (not the generic
+    // `(set.all ...)` App) and that both value and error filters appear.
+    #[tokio::test]
+    async fn all_emits_two_set_filter_lambdas() {
+        let smt = encode_expr("context.ports.all(it > 0)").await;
+        let filters = smt.matches("set.filter (lambda ((!anyall!it").count();
+        assert_eq!(filters, 2, "expected two set.filter lambdas, got SMT:\n{smt}");
+        assert!(smt.contains("(as set.empty"), "error filter should compare to empty set:\n{smt}");
+        assert!(smt.contains("(as none"), "tri-valued result should carry a none branch:\n{smt}");
+        // The generic App fallback `(set.all ...)` must NOT appear — the op is
+        // emitted as the two filters, never as a bare `set.all` application.
+        assert!(!smt.contains("(set.all "), "set.all must encode via set.filter, not as a bare op:\n{smt}");
+    }
+
+    // F-2 (mutation 3a-i): the VALUE filter body must be the PREDICATE and the
+    // ERROR filter body must be the ERROR term — swapping the two lambdas
+    // (`pred_enc`↔`err_enc`) is a silent SMT-semantics bug the lambda-COUNT
+    // test above does not catch. For `it > 0` the value filter body is the
+    // compiled predicate `(not (bvsle !anyall!it (_ bv0 64)))` and the error
+    // filter body is `false` (the predicate never errors), so they are
+    // distinguishable. The whole `set.all` encoding is pinned by snapshot so
+    // ANY lambda-body swap (or template drift) diffs.
+    #[tokio::test]
+    async fn all_value_filter_is_predicate_error_filter_is_error() {
+        let smt = encode_expr("context.ports.all(it > 0)").await;
+        // Emission order (from the `(ite (not (= (set.filter … ERR …) empty))
+        // none (some (= (set.filter … VAL …) S)))` shape): the ERROR filter
+        // comes FIRST (in the `ite` condition), the VALUE filter SECOND (in the
+        // `some`). This pins both the body→filter mapping and that ordering.
+        let err_body = extract_filter_body(&smt, 0);
+        let val_body = extract_filter_body(&smt, 1);
+        assert!(
+            val_body.contains("bvsle"),
+            "VALUE filter body must be the predicate `(not (bvsle …))`, got `{val_body}`\nSMT:\n{smt}"
+        );
+        assert_eq!(
+            err_body, "false",
+            "ERROR filter body must be `false` for a non-erroring predicate, got `{err_body}`\nSMT:\n{smt}"
+        );
+        // And the predicate (bvsle) must NOT appear in the error filter.
+        assert!(
+            !err_body.contains("bvsle"),
+            "a lambda swap put the predicate in the ERROR filter: `{err_body}`\nSMT:\n{smt}"
+        );
+    }
+
+    /// Return the body of the `n`-th `set.filter (lambda ((!anyall!it T)) BODY)`
+    /// in `smt` (0-indexed, emission order), via balanced-paren scanning. `T`
+    /// may itself be parenthesized (e.g. `(_ BitVec 64)`).
+    fn extract_filter_body(smt: &str, n: usize) -> String {
+        let needle = "set.filter (lambda ((!anyall!it ";
+        let mut from = 0usize;
+        for _ in 0..=n {
+            let i = smt[from..].find(needle).expect("set.filter lambda not found");
+            from += i + needle.len();
+        }
+        // Now positioned at the start of the type token `T` inside
+        // `((!anyall!it T)) BODY)`. Skip T (a balanced parens group, or an atom).
+        let rest = &smt[from..];
+        let mut p = 0usize;
+        if rest.starts_with('(') {
+            let mut depth = 0i32;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            p = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            p = rest.find(|c: char| c == ')' || c.is_whitespace()).unwrap_or(rest.len());
+        }
+        // After T comes `))` closing the binding and the binding-list, then the body.
+        let rest = &rest[p..];
+        let after = rest.find("))").expect("binding-list close `))`") + 2;
+        let body_rel = after
+            + rest[after..]
+                .find(|c: char| !c.is_whitespace())
+                .expect("lambda body");
+        let b = &rest[body_rel..];
+        if !b.starts_with('(') {
+            let end = b.find(|c: char| c == ')' || c.is_whitespace()).unwrap_or(b.len());
+            return b[..end].to_string();
+        }
+        let mut depth = 0i32;
+        for (i, c) in b.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return b[..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced lambda body");
+    }
+
+    // `.any` lowers to `!all(!p)`, so its encoding also carries the two filters.
+    #[tokio::test]
+    async fn any_emits_two_set_filter_lambdas() {
+        let smt = encode_expr("context.ports.any(it > 0)").await;
+        let filters = smt.matches("set.filter (lambda ((!anyall!it").count();
+        assert_eq!(filters, 2, "`.any` should still emit two set.filter lambdas:\n{smt}");
     }
 }

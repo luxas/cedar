@@ -137,11 +137,130 @@ pub(crate) fn footprint<'a>(x: &'a Expr, env: &'a SymEnv) -> Box<dyn Iterator<It
             Box::new(exprs.iter().flat_map(|x| footprint(x, env)))
         }
         ExprKind::Record(axs) => Box::new(axs.values().flat_map(|x| footprint(x, env))),
+        // `.all` (feature `anyall`, D-70 A / D-71): the receiver's own footprint,
+        // plus the `it`-free entity subterms of the predicate compiled against
+        // the reserved element variable. Mirrors Lean `footprint`'s `.all` arm
+        // (`footprint x₁ ∪ footprintAllPred p x₁`).
+        #[cfg(feature = "anyall")]
+        ExprKind::All { expr: x1, pred: p } => {
+            Box::new(footprint(x1, env).chain(footprint_all_pred(p, x1, env)))
+        }
         ExprKind::Slot(_) => unimplemented!("analyzing templates is not currently supported"),
         ExprKind::Unknown(_) => {
             unimplemented!("analyzing partial expressions is not currently supported")
         }
         _ => unimplemented!("analyzing `{}` is not currently supported", x),
+    }
+}
+
+/// Footprint of a quantifier predicate `p` compiled against the element term
+/// `it` (feature `anyall`, D-70 A): the entity-typed compiled terms of the
+/// `it`-FREE subexpressions of `p`, in the same `of_entity`/`of_branch` shape as
+/// `footprint` for `Expr` (over `compile_pred`). An `it`-dependent subexpression
+/// contributes only its `it`-free children. Mirrors Lean `footprintPred`.
+#[cfg(feature = "anyall")]
+fn footprint_pred(
+    p: &cedar_policy_core::ast::PredExpr,
+    it: &Term,
+    env: &SymEnv,
+) -> Vec<Term> {
+    use cedar_policy_core::ast::PredExprKind;
+    // `ofEntity q`: if `q` mentions `it` it cannot be grounded; else compile it
+    // and keep it iff it is an option-entity term.
+    let of_entity = |q: &cedar_policy_core::ast::PredExpr| -> Vec<Term> {
+        if super::compiler::pred_mentions_item(q) {
+            return Vec::new();
+        }
+        match super::compiler::compile_pred(q, it, env) {
+            Ok(t) if t.type_of().is_option_entity_type() => vec![t],
+            _ => Vec::new(),
+        }
+    };
+    // `ofBranch c ft1 ft2 ft3`: mirror compile's branch laziness.
+    let of_branch =
+        |c: &cedar_policy_core::ast::PredExpr, ft1: Vec<Term>, ft2: Vec<Term>, ft3: Vec<Term>| -> Vec<Term> {
+            match super::compiler::compile_pred(c, it, env) {
+                Ok(Term::Some(t)) if *t == true.into() => ft2,
+                Ok(Term::Some(t)) if *t == false.into() => ft3,
+                Ok(_) => ft1.into_iter().chain(ft2).chain(ft3).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+    match p.expr_kind() {
+        PredExprKind::Item => Vec::new(),
+        PredExprKind::Lit(_) | PredExprKind::Var(_) => of_entity(p),
+        PredExprKind::If { test_expr, then_expr, else_expr } => of_branch(
+            test_expr,
+            footprint_pred(test_expr, it, env),
+            footprint_pred(then_expr, it, env),
+            footprint_pred(else_expr, it, env),
+        ),
+        PredExprKind::And { left, right } => of_branch(
+            left,
+            footprint_pred(left, it, env),
+            footprint_pred(right, it, env),
+            Vec::new(),
+        ),
+        PredExprKind::Or { left, right } => of_branch(
+            left,
+            footprint_pred(left, it, env),
+            Vec::new(),
+            footprint_pred(right, it, env),
+        ),
+        PredExprKind::BinaryApp { arg1, arg2, .. } => of_entity(p)
+            .into_iter()
+            .chain(footprint_pred(arg1, it, env))
+            .chain(footprint_pred(arg2, it, env))
+            .collect(),
+        PredExprKind::GetAttr { expr, .. } => of_entity(p)
+            .into_iter()
+            .chain(footprint_pred(expr, it, env))
+            .collect(),
+        PredExprKind::HasAttr { expr, .. }
+        | PredExprKind::ExtHasAttr { expr, .. }
+        | PredExprKind::Like { expr, .. }
+        | PredExprKind::Is { expr, .. }
+        | PredExprKind::UnaryApp { arg: expr, .. } => footprint_pred(expr, it, env),
+        PredExprKind::ExtensionFunctionApp { args, .. } => {
+            args.iter().flat_map(|x| footprint_pred(x, it, env)).collect()
+        }
+        PredExprKind::Record(m) => m.values().flat_map(|x| footprint_pred(x, it, env)).collect(),
+    }
+}
+
+/// Footprint of `expr.all(p)`'s predicate (feature `anyall`, D-71): compile the
+/// receiver; if it is a set term, collect `footprint_pred` of `p` against the
+/// element binding, mirroring compile's literal-fold / symbolic split. Kept
+/// separate from `footprint` so the receiver match does not complicate it.
+/// Mirrors Lean `footprintAllPred`.
+#[cfg(feature = "anyall")]
+fn footprint_all_pred(
+    p: &cedar_policy_core::ast::PredExpr,
+    x1: &Expr,
+    env: &SymEnv,
+) -> Vec<Term> {
+    use super::factory::{anyall_it_var, some_of};
+    use super::term_type::TermType;
+    let t = match compile(x1, env) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    if matches!(t, Term::None(_)) {
+        return Vec::new(); // D-69: a `.none` receiver compiles no predicate.
+    }
+    let got = option_get(t);
+    let TermType::Set { ty: elem_ty } = got.type_of() else {
+        return Vec::new();
+    };
+    let elem_ty = std::sync::Arc::unwrap_or_clone(elem_ty);
+    match &got {
+        // D-71: literal set of literal elements ⇒ predicate per element.
+        Term::Set { elts, .. } if elts.iter().all(Term::is_literal) => elts
+            .iter()
+            .flat_map(|vi| footprint_pred(p, &some_of(vi.clone()), env))
+            .collect(),
+        // symbolic ⇒ bind the reserved element variable.
+        _ => footprint_pred(p, &some_of(Term::Var(anyall_it_var(elem_ty))), env),
     }
 }
 
@@ -245,4 +364,94 @@ pub fn enforce<'a>(xs: impl IntoIterator<Item = &'a Expr>, env: &SymEnv) -> BTre
         .iter()
         .flat_map(|t| ts.iter().map(|t2| transitivity(t, t2, &env.entities)));
     ac.chain(tr).collect()
+}
+
+// F-6 (feature `anyall`): deterministic unit tests for the `.all` footprint
+// arm (`footprint`/`footprint_pred`/`footprint_all_pred`). The cvc5 proof in
+// `tests/anyall.rs` quantifies over `Set<Long>` (empty entity footprint), so it
+// cannot see a wrong footprint; these tests use a `Set<Entity>` attribute so
+// the receiver and the predicate's `it`-free entity term both appear, and pin
+// that the footprint is the UNION of the two.
+#[cfg(all(test, feature = "anyall"))]
+#[expect(clippy::panic, reason = "unit tests")]
+mod anyall_footprint_tests {
+    use std::str::FromStr;
+
+    use cedar_policy::{RequestEnv, Schema};
+
+    use super::footprints;
+    use crate::symcc::compiler::compile;
+    use crate::symcc::env::SymEnv;
+    use cedar_policy_core::ast::Expr;
+
+    fn sym_env() -> SymEnv {
+        // `resource.owners : Set<User>` (an entity set) ⇒ a `.all` over it has a
+        // non-empty entity footprint. `User.manager : User` lets the negative
+        // `it.manager == it` case be well-typed.
+        let schema = Schema::from_cedarschema_str(
+            r#"
+            entity User { manager: User };
+            entity Doc { owner: User, owners: Set<User> };
+            action view appliesTo {
+              principal: [User],
+              resource: [Doc],
+              context: {}
+            };
+        "#,
+        )
+        .unwrap()
+        .0;
+        let req = RequestEnv::new(
+            "User".parse().unwrap(),
+            "Action::\"view\"".parse().unwrap(),
+            "Doc".parse().unwrap(),
+        );
+        SymEnv::new(&schema, &req).expect("malformed sym env")
+    }
+
+    fn footprint_count(src: &str) -> usize {
+        let env = sym_env();
+        let e = Expr::from_str(src).unwrap_or_else(|err| panic!("parse `{src}`: {err}"));
+        footprints([&e], &env).len()
+    }
+
+    // `resource.owners.all(it == principal)`: the footprint is the UNION of the
+    // receiver's footprint (the `resource`/`Doc` entity term reached via
+    // `resource.owners`) and the predicate's `it`-free entity term (`principal`).
+    // So it must be STRICTLY larger than either half alone — pinning that the
+    // `.all` arm chains BOTH `footprint(x1)` and `footprint_all_pred`.
+    #[test]
+    fn all_footprint_is_receiver_union_predicate() {
+        let full = footprint_count("resource.owners.all(it == principal)");
+        // Receiver alone: `resource` (an entity) contributes one entity term.
+        let receiver_only = footprint_count("resource.owners.contains(principal)");
+        // `resource` term + `principal` term ⇒ at least 2, and more than the
+        // receiver-only expression's footprint.
+        assert!(
+            full >= 2,
+            "entity-set `.all` footprint should contain the receiver AND the predicate's \
+             it-free entity term (expected >= 2), got {full}"
+        );
+        assert!(
+            full > 0 && receiver_only > 0,
+            "both the full `.all` and the receiver-only expr must have non-empty entity footprints \
+             (full={full}, receiver_only={receiver_only})"
+        );
+    }
+
+    // Negative case: `resource.owners.all(it.manager == it)` — the only entity
+    // terms in the predicate (`it.manager`, `it`) are `it`-DEPENDENT, so
+    // `footprint_pred` contributes NOTHING from the predicate; the footprint is
+    // then just the receiver's (the `resource` entity term), STRICTLY smaller
+    // than the `it == principal` case which adds `principal`.
+    #[test]
+    fn all_footprint_drops_it_dependent_entity_terms() {
+        let it_dep = footprint_count("resource.owners.all(it.manager == it)");
+        let it_free = footprint_count("resource.owners.all(it == principal)");
+        assert!(
+            it_free > it_dep,
+            "an `it`-dependent predicate (`it.manager == it`) must contribute no footprint term, \
+             so its footprint ({it_dep}) must be smaller than the `it == principal` case ({it_free})"
+        );
+    }
 }

@@ -49,6 +49,39 @@ pub fn some_of(t: Term) -> Term {
     Term::Some(Arc::new(t))
 }
 
+/// The reserved bound element variable for the `.all` set quantifier
+/// (feature `anyall`, D-51). Mirrors Lean `Factory.anyAllItVar`. Its `id`
+/// cannot be produced by the compiler for any Cedar variable, so it never
+/// clashes with a free symbolic variable; `set.all` binds it. `elem_ty` is
+/// the set's element type.
+#[cfg(feature = "anyall")]
+pub fn anyall_it_var(elem_ty: TermType) -> super::term::TermVar {
+    super::term::TermVar {
+        id: "!anyall!it".into(),
+        ty: elem_ty,
+    }
+}
+
+/// Smart constructor for the `.all` set-quantifier term (feature `anyall`,
+/// D-52/D-68). Mirrors Lean `Factory.set.all`. `set` is the compiled receiver
+/// (type `.set elem_ty`); `pred`/`err` are boolean Terms over
+/// `anyall_it_var elem_ty` (the per-element predicate value and error). The
+/// result is `.option .bool` (tri-valued, D-35), encoded via two `set.filter`
+/// comprehensions under `HO_ALL`.
+///
+/// Per D-68 this ALWAYS builds the symbolic `.app Op::SetAll` node (no literal
+/// fold here): the literal-receiver constant fold lives in the compiler's
+/// `.all` arm, which compiles the predicate per element and so produces
+/// *reduced* bodies that survive recompilation under an interpretation.
+#[cfg(feature = "anyall")]
+pub fn set_all(set: Term, pred: Term, err: Term) -> Term {
+    Term::App {
+        op: Op::SetAll,
+        args: Arc::new(vec![set, pred, err]),
+        ret_ty: TermType::option_of(TermType::Bool),
+    }
+}
+
 pub fn set_of(ts: impl IntoIterator<Item = Term>, elts_ty: TermType) -> Term {
     Term::Set {
         elts: Arc::new(ts.into_iter().collect()),
