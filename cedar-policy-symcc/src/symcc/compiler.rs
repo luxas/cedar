@@ -2111,4 +2111,41 @@ mod anyall_tests {
         let res = compile(&parse_expr("context.friends.all(it in principal)"), &sym_env());
         assert_matches!(res, Err(CompileError::UnsupportedFeature(_)));
     }
+
+    // F-2 (mutation 3b): the literal-fold path (D-68) must fold to the correct
+    // VALUE, not merely "no set.all node". A literal set of literal elements
+    // compiles the predicate per element and constant-folds the conjunction;
+    // flipping the fold seed `true`→`false` corrupts the value. These tests pin
+    // it: all-true ⇒ `some(true)`, a false element ⇒ `some(false)`.
+    #[test]
+    fn all_literal_fold_all_true_is_some_true() {
+        let t = compile(&parse_expr("[1, 2, 3].all(it > 0)"), &sym_env()).unwrap();
+        assert_eq!(
+            t,
+            some_of(Term::from(true)),
+            "literal `[1,2,3].all(it > 0)` must fold to `some(true)`, got {t}"
+        );
+    }
+
+    #[test]
+    fn all_literal_fold_one_false_is_some_false() {
+        let t = compile(&parse_expr("[1, -1].all(it > 0)"), &sym_env()).unwrap();
+        assert_eq!(
+            t,
+            some_of(Term::from(false)),
+            "literal `[1,-1].all(it > 0)` must fold to `some(false)`, got {t}"
+        );
+    }
+
+    // `.any` lowers to `!all(!p)`; a literal `.any` with a true element folds to
+    // `some(true)` (the `!` on the quantifier value is applied by the lowering).
+    #[test]
+    fn any_literal_fold_one_true_is_some_true() {
+        let t = compile(&parse_expr("[-1, 2].any(it > 0)"), &sym_env()).unwrap();
+        assert_eq!(
+            t,
+            some_of(Term::from(true)),
+            "literal `[-1,2].any(it > 0)` must fold to `some(true)`, got {t}"
+        );
+    }
 }

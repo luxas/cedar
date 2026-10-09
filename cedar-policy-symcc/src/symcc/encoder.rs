@@ -1307,6 +1307,98 @@ mod anyall_encoder_tests {
         assert!(!smt.contains("(set.all "), "set.all must encode via set.filter, not as a bare op:\n{smt}");
     }
 
+    // F-2 (mutation 3a-i): the VALUE filter body must be the PREDICATE and the
+    // ERROR filter body must be the ERROR term — swapping the two lambdas
+    // (`pred_enc`↔`err_enc`) is a silent SMT-semantics bug the lambda-COUNT
+    // test above does not catch. For `it > 0` the value filter body is the
+    // compiled predicate `(not (bvsle !anyall!it (_ bv0 64)))` and the error
+    // filter body is `false` (the predicate never errors), so they are
+    // distinguishable. The whole `set.all` encoding is pinned by snapshot so
+    // ANY lambda-body swap (or template drift) diffs.
+    #[tokio::test]
+    async fn all_value_filter_is_predicate_error_filter_is_error() {
+        let smt = encode_expr("context.ports.all(it > 0)").await;
+        // Emission order (from the `(ite (not (= (set.filter … ERR …) empty))
+        // none (some (= (set.filter … VAL …) S)))` shape): the ERROR filter
+        // comes FIRST (in the `ite` condition), the VALUE filter SECOND (in the
+        // `some`). This pins both the body→filter mapping and that ordering.
+        let err_body = extract_filter_body(&smt, 0);
+        let val_body = extract_filter_body(&smt, 1);
+        assert!(
+            val_body.contains("bvsle"),
+            "VALUE filter body must be the predicate `(not (bvsle …))`, got `{val_body}`\nSMT:\n{smt}"
+        );
+        assert_eq!(
+            err_body, "false",
+            "ERROR filter body must be `false` for a non-erroring predicate, got `{err_body}`\nSMT:\n{smt}"
+        );
+        // And the predicate (bvsle) must NOT appear in the error filter.
+        assert!(
+            !err_body.contains("bvsle"),
+            "a lambda swap put the predicate in the ERROR filter: `{err_body}`\nSMT:\n{smt}"
+        );
+    }
+
+    /// Return the body of the `n`-th `set.filter (lambda ((!anyall!it T)) BODY)`
+    /// in `smt` (0-indexed, emission order), via balanced-paren scanning. `T`
+    /// may itself be parenthesized (e.g. `(_ BitVec 64)`).
+    fn extract_filter_body(smt: &str, n: usize) -> String {
+        let needle = "set.filter (lambda ((!anyall!it ";
+        let mut from = 0usize;
+        for _ in 0..=n {
+            let i = smt[from..].find(needle).expect("set.filter lambda not found");
+            from += i + needle.len();
+        }
+        // Now positioned at the start of the type token `T` inside
+        // `((!anyall!it T)) BODY)`. Skip T (a balanced parens group, or an atom).
+        let rest = &smt[from..];
+        let mut p = 0usize;
+        if rest.starts_with('(') {
+            let mut depth = 0i32;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            p = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            p = rest.find(|c: char| c == ')' || c.is_whitespace()).unwrap_or(rest.len());
+        }
+        // After T comes `))` closing the binding and the binding-list, then the body.
+        let rest = &rest[p..];
+        let after = rest.find("))").expect("binding-list close `))`") + 2;
+        let body_rel = after
+            + rest[after..]
+                .find(|c: char| !c.is_whitespace())
+                .expect("lambda body");
+        let b = &rest[body_rel..];
+        if !b.starts_with('(') {
+            let end = b.find(|c: char| c == ')' || c.is_whitespace()).unwrap_or(b.len());
+            return b[..end].to_string();
+        }
+        let mut depth = 0i32;
+        for (i, c) in b.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return b[..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced lambda body");
+    }
+
     // `.any` lowers to `!all(!p)`, so its encoding also carries the two filters.
     #[tokio::test]
     async fn any_emits_two_set_filter_lambdas() {
