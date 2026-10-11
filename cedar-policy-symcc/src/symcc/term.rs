@@ -198,6 +198,29 @@ impl Term {
             _ => false,
         }
     }
+
+    /// Does the term contain a `set.all` application node anywhere (D-78)?
+    /// Mirrors the Lean `Term.containsSetAll` structural walk (`Encoder.lean`):
+    /// `true` on any `Op::SetAll` application, otherwise recurse into children.
+    /// Drives `check_unsat_asserts` / `check_sat_asserts`' choice of SMT logic
+    /// (`HO_ALL` when some asserted term carries a `set.all`, else the
+    /// first-order `ALL`); the Lean encoder makes the byte-identical choice so
+    /// the `symcc-*` differential stays in lockstep (D-36).
+    pub fn contains_set_all(&self) -> bool {
+        match self {
+            Term::Var(_) => false,
+            Term::Prim(_) => false,
+            Term::None(_) => false,
+            Term::Some(t) => t.contains_set_all(),
+            Term::Set { elts, .. } => elts.iter().any(Term::contains_set_all),
+            Term::Record(m) => m.values().any(Term::contains_set_all),
+            // The `set.all` node only exists under the `anyall` feature; without
+            // it no term can carry one, so every `App` just recurses.
+            #[cfg(feature = "anyall")]
+            Term::App { op: Op::SetAll, .. } => true,
+            Term::App { args, .. } => args.iter().any(Term::contains_set_all),
+        }
+    }
 }
 
 impl std::fmt::Display for Term {

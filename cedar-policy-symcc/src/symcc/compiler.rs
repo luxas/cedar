@@ -2148,4 +2148,55 @@ mod anyall_tests {
             "literal `[-1,2].any(it > 0)` must fold to `some(true)`, got {t}"
         );
     }
+
+    // D-78: `Term::contains_set_all` detects a `set.all` node, and the encoder's
+    // `logic_for` selects `HO_ALL` for a query carrying one and the first-order
+    // `ALL` otherwise. Byte-level, deterministic, no cvc5 — mirrors the Lean
+    // `Encoder.lean` selection so the `symcc-*` differential stays in lockstep.
+    #[test]
+    fn d78_logic_selection_ho_all_only_for_set_all() {
+        use std::sync::Arc;
+        // Symbolic `.all` ⇒ a `set.all` node (D-68 symbolic path).
+        let all_term = compile(&parse_expr("context.ports.all(it > 0)"), &sym_env()).unwrap();
+        assert!(
+            all_term.contains_set_all(),
+            "a symbolic `.all` term must contain a set.all node: {all_term}"
+        );
+        // A `.all`-free boolean term (`context.ports.contains(1)`) — no quantifier.
+        let plain_term = compile(&parse_expr("context.ports.contains(1)"), &sym_env()).unwrap();
+        assert!(
+            !plain_term.contains_set_all(),
+            "a `.all`-free term must not contain a set.all node: {plain_term}"
+        );
+
+        // A mixed query (`.all`-free then `.all`) must still select `HO_ALL`
+        // (match the Lean #eval mutation sentinels), so keep owned copies before
+        // the originals are moved into the single-term assert lists below.
+        let mixed: super::super::verifier::Asserts =
+            Arc::new(vec![plain_term.clone(), all_term.clone()]);
+        let all_asserts: super::super::verifier::Asserts = Arc::new(vec![all_term]);
+        let plain_asserts: super::super::verifier::Asserts = Arc::new(vec![plain_term]);
+        let empty: super::super::verifier::Asserts = Arc::new(vec![]);
+
+        assert_eq!(
+            super::super::logic_for(&all_asserts),
+            "HO_ALL",
+            "a query with a set.all must select the HO_ALL logic"
+        );
+        assert_eq!(
+            super::super::logic_for(&plain_asserts),
+            "ALL",
+            "a set.all-free query must select the first-order ALL logic"
+        );
+        assert_eq!(
+            super::super::logic_for(&empty),
+            "ALL",
+            "an empty query selects the first-order ALL logic"
+        );
+        assert_eq!(
+            super::super::logic_for(&mixed),
+            "HO_ALL",
+            "a query containing any set.all selects HO_ALL"
+        );
+    }
 }
