@@ -57,6 +57,7 @@ use encoder::Encoder;
 use env::to_validator_request_env;
 use solver::{Decision, Solver};
 use std::borrow::Borrow;
+use term::Term;
 use verifier::Asserts;
 
 use crate::err::{Error, Result};
@@ -93,6 +94,20 @@ pub enum ResetMode {
     /// This is appropriate only for `Solver` implementations that send each
     /// query as a standalone script (so there is no leftover assertions to clear).
     Comment,
+}
+
+/// D-78: select the SMT logic for a set of asserts. `HO_ALL` (higher-order,
+/// needed by the `set.all` `set.filter` comprehension encoding, D-52) exactly
+/// when some asserted term carries a `set.all` node; otherwise the first-order
+/// `ALL` the encoder used before `.all` support. Mirrors the Lean `encode`
+/// selection in `Encoder.lean` so the two engines emit a byte-identical
+/// `(set-logic …)` line and the `symcc-*` differential stays in lockstep (D-36).
+fn logic_for(asserts: &Asserts) -> &'static str {
+    if asserts.iter().any(Term::contains_set_all) {
+        "HO_ALL"
+    } else {
+        "ALL"
+    }
 }
 
 /// Internal symbolic compiler.
@@ -161,7 +176,7 @@ impl<S: Solver> SymCompiler<S> {
             self.emit_reset().await?;
             self.solver
                 .smtlib_input()
-                .set_logic("HO_ALL")
+                .set_logic(logic_for(asserts))
                 .await
                 .map_err(|err| Error::EncodeError(err.into()))?;
             let mut encoder = Encoder::new(symenv, self.solver.smtlib_input())?;
@@ -215,7 +230,7 @@ impl<S: Solver> SymCompiler<S> {
             self.solver.enable_models().await?;
             self.solver
                 .smtlib_input()
-                .set_logic("HO_ALL")
+                .set_logic(logic_for(asserts))
                 .await
                 .map_err(|err| Error::EncodeError(err.into()))?;
             let mut encoder =
