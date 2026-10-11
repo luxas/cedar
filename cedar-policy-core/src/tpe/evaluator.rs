@@ -568,24 +568,33 @@ impl Evaluator<'_> {
                         expr: Arc::new(recv),
                         pred: pred.clone(),
                     }),
-                    // Concrete receiver: fold per element exactly like the
-                    // Phase-3 concrete evaluator (`evaluator.rs` `.all` arm):
-                    // non-set receiver => error; per element instantiate the
-                    // predicate and interpret it; any erroring/non-bool element
-                    // => QuantifierError image (`mk_error`); NO short-circuit on
-                    // a `false` element, because a later element may still error
-                    // (reqs 2.5/2.8); empty set => `true`. If any element's
-                    // predicate stays residual, conservatively keep the whole
-                    // node residual with the receiver rebuilt from its concrete
-                    // value so it is not re-folded (7.3's full per-element
-                    // refinement is deferred, D-80 / Phase 9).
+                    // Concrete receiver: refine the quantifier per element
+                    // (req 7.3 / D-80 full / D-92). Non-set receiver => error.
+                    // For each element, instantiate the predicate and interpret
+                    // it:
+                    //   * a concrete `true`  => the element is discharged (drop);
+                    //   * a concrete `false` => pin `decided_false` (the final
+                    //     value is `false` unless a pending element errors);
+                    //   * a concrete error / non-bool => the whole node is the
+                    //     `QuantifierError` image (`mk_error`), immediately
+                    //     (reqs 2.5/2.6);
+                    //   * a residual => keep it in `pending`.
+                    // There is NO short-circuit on a `false` element: every
+                    // element is interpreted, because a later element may still
+                    // error and that error outranks the pinned `false` (2.8).
+                    // After the loop: empty `pending` collapses to
+                    // `Concrete(!decided_false)` (the fold completed — all-true
+                    // => `true`, some-false => `false`); otherwise emit a refined
+                    // `AllPartial` carrying the pinned `false` and the undecided
+                    // elements (7.3). This supersedes the Phase-6.5 conservative
+                    // "keep the whole node" behaviour.
                     Residual::Concrete { value, .. } => {
                         let set = match value.get_as_set() {
                             Ok(set) => set,
                             Err(_) => return mk_error(),
                         };
-                        let mut all_true = true;
-                        let mut any_residual = false;
+                        let mut decided_false = false;
+                        let mut pending: Vec<Residual> = Vec::new();
                         for elem in set.iter() {
                             let inst = pred.instantiate(elem);
                             let elem_residual =
@@ -593,23 +602,62 @@ impl Evaluator<'_> {
                             match &elem_residual {
                                 Residual::Error(_) => return mk_error(),
                                 Residual::Concrete { value, .. } => match value.get_as_bool() {
-                                    Ok(b) => all_true &= b,
+                                    Ok(true) => {}             // discharged
+                                    Ok(false) => decided_false = true,
                                     // A non-boolean per-element result is a
                                     // QuantifierError, matching Lean/Rust (D-16).
                                     Err(_) => return mk_error(),
                                 },
-                                Residual::Partial { .. } => any_residual = true,
+                                Residual::Partial { .. } => pending.push(elem_residual),
                             }
                         }
-                        if any_residual {
-                            mk_residual(ResidualKind::All {
-                                expr: Arc::new(recv),
-                                pred: pred.clone(),
-                            })
+                        if pending.is_empty() {
+                            mk_concrete((!decided_false).into())
                         } else {
-                            mk_concrete(all_true.into())
+                            mk_residual(ResidualKind::AllPartial {
+                                decided_false,
+                                pending: Arc::new(pending),
+                            })
                         }
                     }
+                }
+            }
+            // A refined quantifier (D-92) is re-interpreted idempotently: each
+            // still-pending element predicate is interpreted again (an unknown
+            // it reads may now be known), applying the same per-element fold —
+            // newly-`true` elements drop, a newly-`false` element pins
+            // `decided_false`, an element error collapses the whole node to the
+            // `QuantifierError` image, and still-residual elements stay pending.
+            // No short-circuit (2.8). Empty `pending` collapses to
+            // `Concrete(!decided_false)`. This keeps a second TPE pass sound and
+            // monotone (a pending element can only become decided, never
+            // un-decided).
+            #[cfg(feature = "anyall")]
+            ResidualKind::AllPartial {
+                decided_false,
+                pending,
+            } => {
+                let mut decided_false = *decided_false;
+                let mut new_pending: Vec<Residual> = Vec::new();
+                for elem in pending.as_ref() {
+                    let elem_residual = self.interpret(elem);
+                    match &elem_residual {
+                        Residual::Error(_) => return mk_error(),
+                        Residual::Concrete { value, .. } => match value.get_as_bool() {
+                            Ok(true) => {}
+                            Ok(false) => decided_false = true,
+                            Err(_) => return mk_error(),
+                        },
+                        Residual::Partial { .. } => new_pending.push(elem_residual),
+                    }
+                }
+                if new_pending.is_empty() {
+                    mk_concrete((!decided_false).into())
+                } else {
+                    mk_residual(ResidualKind::AllPartial {
+                        decided_false,
+                        pending: Arc::new(new_pending),
+                    })
                 }
             }
         }
@@ -2798,6 +2846,8 @@ mod tests {
     #[cfg(feature = "anyall")]
     mod anyall {
         use super::*;
+        use crate::tpe::residual::ResidualKind;
+        use cool_asserts::assert_matches;
 
         fn anyall_schema() -> ValidatorSchema {
             parse_schema(
@@ -2966,15 +3016,17 @@ mod tests {
         }
 
         #[test]
-        fn concrete_receiver_residual_predicate_keeps_node() {
+        fn concrete_receiver_residual_predicate_refines() {
             // Concrete receiver, but the predicate reads an UNKNOWN request
-            // attribute (`resource.unknownish` via a residual sub-term): under
-            // D-80 option A, a residual per-element predicate conservatively
-            // keeps the whole node residual (7.3/7.4). Here the predicate
-            // compares `it` to `resource`'s (unknown) identity through `in`,
-            // which stays residual while `context.recs` is concrete.
-            // We keep the receiver concrete and make the predicate residual by
-            // referencing the unknown principal.
+            // value (`principal`) through `in`, so the per-element predicate
+            // stays residual. Under the Phase-6.5 conservative fold (D-80 A)
+            // this kept the WHOLE node (`[E::"x"].all(it in principal)`); under
+            // the req-7.3 / D-92 refinement it now REFINES to an `AllPartial`
+            // carrying only the undecided elements, re-expanded for
+            // reauthorization as `[<pending bools>, <!decided_false>].all(it)`.
+            // One concrete element whose predicate is residual, nothing yet
+            // decided `false`, so: pending = [`E::"x" in principal`],
+            // decided_false = false (marker `true`).
             let schema = parse_schema(
                 r#"entity E in E;
                    action a appliesTo {
@@ -2999,11 +3051,464 @@ mod tests {
                 entities: &PartialEntities::new(),
                 extensions: Extensions::all_available(),
             };
-            // `it in principal` with unknown principal => per-element predicate
-            // residual => whole node retained with the concrete receiver.
+            // Refined: the receiver is consumed, the single pending element
+            // predicate and the `true` (nothing-pinned) marker become set
+            // elements, quantified by the identity predicate `it`.
             assert_snapshot!(
                 interpret_typed_str_to_str(&eval, r#"context.es.all(it in principal)"#, &schema),
-                @r#"[E::"x"].all(it in principal)"#
+                @r#"[E::"x" in principal, true].all(it)"#
+            );
+        }
+
+        // --- req 7.3 / D-92: per-element refinement with a mix of decided and
+        // pending elements, plus end-to-end reauthorization parity ---
+
+        /// Schema for the mixed-refinement tests: a concrete `context.es`
+        /// (`Set<E>`) receiver, an unknown `principal` the pending element reads
+        /// through `in`, and `E in E` so membership (`in`) is meaningful.
+        fn mixed_schema() -> ValidatorSchema {
+            parse_schema(
+                r#"entity E in E;
+                   action a appliesTo {
+                     principal: E, resource: E, context: { es: Set<E> }
+                   };"#,
+            )
+        }
+
+        /// A `.all` over a concrete 3-element set `[E::"t", E::"f", E::"u"]`
+        /// whose predicate decides `E::"t"` true (dropped), `E::"f"` false
+        /// (pins `decided_false`), and leaves `E::"u"` pending (`it in
+        /// principal`, principal unknown). The TPE residual must therefore be
+        /// `AllPartial { decided_false: true, pending: [E::"u" in principal] }`,
+        /// re-expanded as `[E::"u" in principal, false].all(it)` (marker `false`
+        /// because a `false` is already pinned).
+        const MIXED_SRC: &str = r#"context.es.all(if it == E::"t" then true else (if it == E::"f" then false else it in principal))"#;
+
+        fn mixed_tpe_residual() -> Residual {
+            let schema = mixed_schema();
+            let Ok(Context::Value(context)) = Context::from_json_value(serde_json::json!({
+                "es": [
+                    {"__entity":{"type":"E","id":"t"}},
+                    {"__entity":{"type":"E","id":"f"}},
+                    {"__entity":{"type":"E","id":"u"}}
+                ]
+            })) else {
+                panic!("expected concrete context")
+            };
+            let req = PartialRequest::new(
+                parse_partial_euid("E"), // principal unknown
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid(r#"E::"r""#),
+                Some(context),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &req,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            eval.interpret_expr(&parse_typed_expr(MIXED_SRC, eval.request, &schema, &SlotEnv::new()))
+                .unwrap()
+        }
+
+        #[test]
+        fn concrete_receiver_mixed_elements_refines() {
+            // Shape check: exactly one pending element, with `decided_false`
+            // pinned (the marker re-expands to `false`).
+            let residual = mixed_tpe_residual();
+            assert_matches!(
+                &residual,
+                Residual::Partial {
+                    kind: ResidualKind::AllPartial { decided_false: true, pending },
+                    ..
+                } => assert_eq!(pending.len(), 1, "exactly one undecided element")
+            );
+            // Re-expansion: the single pending bool plus the `false` marker.
+            let e: ast::Expr = residual.into();
+            assert_eq!(e.to_string(), r#"[E::"u" in principal, false].all(it)"#);
+        }
+
+        #[test]
+        fn mixed_refinement_reauthorization_parity() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // The re-authorized refined residual must agree with full `.all`
+            // evaluation of the ORIGINAL expression on every completed input —
+            // the TPE soundness invariant (D-81/D-92). We complete `principal`
+            // and the entity hierarchy several ways, INCLUDING a completion that
+            // ERRORS the pending element (via `E::"u"` not existing is not an
+            // error for `in`; instead we add an error-after-false completion
+            // through an overflow predicate in a sibling test). Here we cover:
+            //   * principal such that `E::"u" in principal` is TRUE  => all
+            //     pending true but `decided_false` is pinned => overall FALSE;
+            //   * principal such that it is FALSE => overall FALSE;
+            // both must equal full evaluation (which also yields FALSE because
+            // `E::"f"` makes the conjunction false, no element errors).
+            let residual = mixed_tpe_residual();
+            let roundtripped: ast::Expr = residual.into();
+            let original: ast::Expr = MIXED_SRC.parse().unwrap();
+            let exts = Extensions::all_available();
+
+            // Entities: E::"u" is or isn't a member of E::"p" (principal).
+            let cases: Vec<(&str, serde_json::Value)> = vec![
+                // u in p  => pending element true, but decided_false pins false
+                (
+                    "u_in_p",
+                    serde_json::json!([
+                        { "uid": {"type":"E","id":"u"}, "attrs": {}, "parents": [ {"type":"E","id":"p"} ] },
+                        { "uid": {"type":"E","id":"p"}, "attrs": {}, "parents": [] },
+                        { "uid": {"type":"E","id":"t"}, "attrs": {}, "parents": [] },
+                        { "uid": {"type":"E","id":"f"}, "attrs": {}, "parents": [] }
+                    ]),
+                ),
+                // u not in p => pending element false, overall false
+                (
+                    "u_not_in_p",
+                    serde_json::json!([
+                        { "uid": {"type":"E","id":"u"}, "attrs": {}, "parents": [] },
+                        { "uid": {"type":"E","id":"p"}, "attrs": {}, "parents": [] },
+                        { "uid": {"type":"E","id":"t"}, "attrs": {}, "parents": [] },
+                        { "uid": {"type":"E","id":"f"}, "attrs": {}, "parents": [] }
+                    ]),
+                ),
+            ];
+            for (name, ents) in cases {
+                let parser: crate::entities::EntityJsonParser<'_, '_> =
+                    crate::entities::EntityJsonParser::new(
+                        None,
+                        exts,
+                        crate::entities::TCComputation::ComputeNow,
+                    );
+                let entities = parser.from_json_value(ents).unwrap();
+                let ctx = Context::from_json_value(serde_json::json!({
+                    "es": [
+                        {"__entity":{"type":"E","id":"t"}},
+                        {"__entity":{"type":"E","id":"f"}},
+                        {"__entity":{"type":"E","id":"u"}}
+                    ]
+                }))
+                .unwrap();
+                let req = Request::new_unchecked(
+                    EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                    EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                    Some(ctx),
+                );
+                let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+                let got = ev.interpret(&roundtripped, &SlotEnv::new());
+                let want = ev.interpret(&original, &SlotEnv::new());
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => assert_eq!(g, w, "case {name}: value mismatch"),
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("case {name}: residual {got:?} vs original {want:?} disagree"),
+                }
+            }
+        }
+
+        #[test]
+        fn mixed_refinement_error_on_pending_outranks_pinned_false() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // The decisive 2.8 case: `decided_false` is pinned, but a PENDING
+            // element ERRORS on the completed input. The error must OUTRANK the
+            // pinned `false` — both the re-authorized residual and the original
+            // must ERROR (a QuantifierError), not return `false`. This is the
+            // behaviour the `decided_false` carrying + no-short-circuit design
+            // exists to guarantee, and the mutation tests below break it.
+            //
+            // Elements (records with a `k` discriminator): k=1 => true (drop);
+            // k=2 => false (pin `decided_false`); k=3 => pending, reading the
+            // unknown `principal.n`. When principal is completed with
+            // `n = i64::MAX`, the pending element's `it.k + principal.n > it.k`
+            // overflows => errors => the whole `.all` is a QuantifierError.
+            let schema_err = parse_schema(
+                r#"entity E { n: Long };
+                   action a appliesTo {
+                     principal: E, resource: E, context: { recs: Set<{ k: Long }> }
+                   };"#,
+            );
+            let src = r#"context.recs.all(if it.k == 1 then true else (if it.k == 2 then false else it.k + principal.n > it.k))"#;
+            let Ok(Context::Value(context)) = Context::from_json_value(serde_json::json!({
+                "recs": [ {"k":1}, {"k":2}, {"k":3} ]
+            })) else {
+                panic!("concrete context")
+            };
+            let preq = PartialRequest::new(
+                parse_partial_euid("E"), // principal unknown
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid(r#"E::"r""#),
+                Some(context),
+                &schema_err,
+            )
+            .unwrap();
+            let peval = Evaluator {
+                request: &preq,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            let residual = peval
+                .interpret_expr(&parse_typed_expr(src, peval.request, &schema_err, &SlotEnv::new()))
+                .unwrap();
+            // decided_false pinned (k=2) and exactly one pending (k=3).
+            assert_matches!(
+                &residual,
+                Residual::Partial {
+                    kind: ResidualKind::AllPartial { decided_false: true, pending },
+                    ..
+                } => assert_eq!(pending.len(), 1)
+            );
+            let roundtripped: ast::Expr = residual.into();
+            let original: ast::Expr = src.parse().unwrap();
+
+            // Complete principal.n = i64::MAX so `3 + MAX` overflows => the
+            // pending element errors => the whole `.all` is a QuantifierError,
+            // outranking the pinned `false` from k=2.
+            let exts = Extensions::all_available();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"p"}, "attrs": {"n": 9223372036854775807_i64}, "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({
+                "recs": [ {"k":1}, {"k":2}, {"k":3} ]
+            }))
+            .unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+            let got = ev.interpret(&roundtripped, &SlotEnv::new());
+            let want = ev.interpret(&original, &SlotEnv::new());
+            assert!(
+                got.is_err() && want.is_err(),
+                "error-on-pending must outrank pinned false: residual {got:?} / original {want:?} must both error"
+            );
+        }
+
+        // --- Mutation checks (D-92): each breaks a distinct part of the design
+        // and is caught by a deterministic test below. Each builds an
+        // `AllPartial` residual directly, re-expands it via `From<Residual> for
+        // Expr`, and evaluates it on a completed input against the answer the
+        // correct design must give — so the mutation is caught regardless of
+        // where in the fold/re-expansion it is introduced. ---
+
+        /// Residualize a boolean expr string into a `Residual` (its sub-terms
+        /// over the unknown `principal` stay residual under TPE), for use as an
+        /// `AllPartial` pending element.
+        fn pending_bool(expr_str: &str) -> Residual {
+            let schema = parse_schema(
+                r#"entity E { n: Long };
+                   action a appliesTo { principal: E, resource: E, context: {} };"#,
+            );
+            let preq = PartialRequest::new(
+                parse_partial_euid("E"), // principal unknown => expr residual
+                r#"Action::"a""#.parse().unwrap(),
+                parse_partial_euid(r#"E::"r""#),
+                Some(Arc::new(std::collections::BTreeMap::new())),
+                &schema,
+            )
+            .unwrap();
+            let eval = Evaluator {
+                request: &preq,
+                entities: &PartialEntities::new(),
+                extensions: Extensions::all_available(),
+            };
+            let r = eval
+                .interpret_expr(&parse_typed_expr(expr_str, eval.request, &schema, &SlotEnv::new()))
+                .unwrap();
+            assert!(r.is_partial(), "pending element must be residual: {r:?}");
+            r
+        }
+
+        #[test]
+        fn mutation_drop_decided_false_yields_wrong_false() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // MUTATION (a): if the fold dropped `decided_false` (built
+            // `AllPartial{decided_false:false, ...}` when it should pin true),
+            // then on a completion where the pending element is TRUE the node
+            // would wrongly be `true`/`false` disagreeing with the original.
+            // We pin the difference: with decided_false=TRUE and a pending
+            // element that completes to TRUE, the correct answer is FALSE; the
+            // mutant (decided_false=FALSE) answers TRUE. The original `.all`
+            // answers FALSE (a `false` element exists). So the mutant diverges.
+            let exts = Extensions::all_available();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            // principal.n = 5 so `principal.n >= 0` is TRUE (pending true).
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"p"}, "attrs": {"n": 5_i64}, "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({})).unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+
+            let pending = pending_bool(r#"principal.n >= 0"#);
+            // CORRECT residual: decided_false = true.
+            let correct = Residual::Partial {
+                kind: ResidualKind::AllPartial {
+                    decided_false: true,
+                    pending: Arc::new(vec![pending.clone()]),
+                },
+                ty: Type::primitive_boolean(),
+            };
+            // MUTANT residual: decided_false dropped to false.
+            let mutant = Residual::Partial {
+                kind: ResidualKind::AllPartial {
+                    decided_false: false,
+                    pending: Arc::new(vec![pending]),
+                },
+                ty: Type::primitive_boolean(),
+            };
+            let correct_expr: ast::Expr = correct.into();
+            let mutant_expr: ast::Expr = mutant.into();
+            let correct_val = ev
+                .interpret(&correct_expr, &SlotEnv::new())
+                .unwrap()
+                .get_as_bool()
+                .unwrap();
+            let mutant_val = ev
+                .interpret(&mutant_expr, &SlotEnv::new())
+                .unwrap()
+                .get_as_bool()
+                .unwrap();
+            assert!(!correct_val, "pinned false must make the node false");
+            assert!(mutant_val, "mutant without decided_false wrongly yields true");
+            assert_ne!(
+                correct_val, mutant_val,
+                "dropping decided_false must change the answer (mutation caught)"
+            );
+        }
+
+        #[test]
+        fn mutation_short_circuit_past_pending_hides_error() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // MUTATION (b): if re-expansion short-circuited past a pending
+            // element once `decided_false` is pinned (e.g. folded to a plain
+            // `false` ignoring pending), then an error-after-false completion
+            // would wrongly yield `false` instead of erroring. The correct
+            // AllPartial re-expansion MUST error; a short-circuiting mutant
+            // (modelled here as the literal `false`) does not.
+            let exts = Extensions::all_available();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            // principal.n = i64::MAX so the pending `principal.n + MAX > 0`
+            // overflows => errors.
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"p"}, "attrs": {"n": 9223372036854775807_i64}, "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({})).unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+
+            let pending = pending_bool(r#"principal.n + 9223372036854775807 > 0"#);
+            let correct = Residual::Partial {
+                kind: ResidualKind::AllPartial {
+                    decided_false: true,
+                    pending: Arc::new(vec![pending]),
+                },
+                ty: Type::primitive_boolean(),
+            };
+            // CORRECT: must error (QuantifierError image).
+            let correct_expr: ast::Expr = correct.into();
+            let correct_res = ev.interpret(&correct_expr, &SlotEnv::new());
+            assert!(
+                correct_res.is_err(),
+                "error on a pending element must outrank the pinned false (no short-circuit)"
+            );
+            // MUTANT: short-circuit-to-false ignoring pending => `false`, which
+            // does NOT error. The two disagree, so the mutation is caught.
+            let mutant_false: ast::Expr = ast::Expr::val(false);
+            let mutant_res = ev.interpret(&mutant_false, &SlotEnv::new());
+            assert!(mutant_res.is_ok(), "the false-mutant does not error");
+            assert!(
+                correct_res.is_err() && mutant_res.is_ok(),
+                "short-circuiting past a pending element hides the error (mutation caught)"
+            );
+        }
+
+        #[test]
+        fn mutation_collapse_nonempty_pending_to_concrete_breaks_parity() {
+            use crate::ast::{Context, EntityUIDEntry, Request};
+            // MUTATION (c): if the fold wrongly collapsed a NON-EMPTY `pending`
+            // to `Concrete(!decided_false)` (as if the fold were complete),
+            // re-authorization parity breaks on any completion where a pending
+            // element decides the result. Here `decided_false=false` and the
+            // single pending element completes to FALSE => correct answer FALSE;
+            // the mutant collapses to `Concrete(true)` (==> TRUE). The original
+            // `.all` yields FALSE. Mutant diverges.
+            let exts = Extensions::all_available();
+            let parser: crate::entities::EntityJsonParser<'_, '_> =
+                crate::entities::EntityJsonParser::new(
+                    None,
+                    exts,
+                    crate::entities::TCComputation::ComputeNow,
+                );
+            // principal.n = -5 so `principal.n >= 0` is FALSE (pending false).
+            let entities = parser
+                .from_json_value(serde_json::json!([
+                    { "uid": {"type":"E","id":"p"}, "attrs": {"n": -5_i64}, "parents": [] }
+                ]))
+                .unwrap();
+            let ctx = Context::from_json_value(serde_json::json!({})).unwrap();
+            let req = Request::new_unchecked(
+                EntityUIDEntry::known(r#"E::"p""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"Action::"a""#.parse().unwrap(), None),
+                EntityUIDEntry::known(r#"E::"r""#.parse().unwrap(), None),
+                Some(ctx),
+            );
+            let ev = crate::evaluator::Evaluator::new(req, &entities, &exts);
+
+            let pending = pending_bool(r#"principal.n >= 0"#);
+            let correct = Residual::Partial {
+                kind: ResidualKind::AllPartial {
+                    decided_false: false,
+                    pending: Arc::new(vec![pending]),
+                },
+                ty: Type::primitive_boolean(),
+            };
+            let correct_expr: ast::Expr = correct.into();
+            let correct_val = ev
+                .interpret(&correct_expr, &SlotEnv::new())
+                .unwrap()
+                .get_as_bool()
+                .unwrap();
+            // MUTANT: collapse non-empty pending to Concrete(!decided_false) =
+            // Concrete(true).
+            let mutant_val = true;
+            assert!(!correct_val, "pending element false => node false");
+            assert_ne!(
+                correct_val, mutant_val,
+                "collapsing non-empty pending to Concrete breaks parity (mutation caught)"
             );
         }
 
