@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Cedar Language Version: TBD
 
+### Added
+
+- (experimental, `anyall`) Symbolic compilation of the `.all` / `.any` set quantifiers over
+  set-free predicates, using the decidable `set.filter` encoding (Mohamed et al., FMCAD
+  2025). A predicate whose `in` has an element-dependent left operand is rejected as
+  unsupported. Behind the off-by-default `anyall` feature.
+
 ### Changed
 
 - Changed IP address ordering (via `Ord` and `PartialOrd`). A prefix-less address is now greater 

@@ -796,17 +796,34 @@ impl Expr {
         ExprBuilder::new().is_entity_type(expr, entity_type)
     }
 
-    /// Create an `all` expression: `expr.all(pred)` — `expr` evaluates to a Set
-    /// and `pred` is a set-free predicate over the element keyword `it`.
+    /// Create an `all` expression: `expr.all(pred)` — true iff `pred` holds for
+    /// every element of the set `expr`.
+    ///
+    /// `expr` must evaluate to a set (otherwise evaluation is a type error) and
+    /// `pred` is a set-free [`PredExpr`] over the element keyword `it`. An empty
+    /// set yields `true` (vacuous truth). Evaluation is deterministic and
+    /// order-independent: if the predicate errors (or is non-boolean) on *any*
+    /// element the whole expression is a single `QuantifierError`, and because an
+    /// error outranks a `false`, evaluation does **not** short-circuit on the
+    /// first `false` element. Requires the `anyall` feature.
     #[cfg(feature = "anyall")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "anyall")))]
     pub fn all(expr: Expr, pred: PredExpr) -> Self {
         use crate::expr_builder::ExprBuilder as _;
         ExprBuilder::new().all(expr, pred)
     }
 
-    /// Create an `any` expression: `expr.any(pred)`, lowered losslessly to
-    /// `!expr.all(!pred)` (cf. `e1 >= e2 := !(e1 < e2)`).
+    /// Create an `any` expression: `expr.any(pred)` — true iff `pred` holds for
+    /// some element of the set `expr`.
+    ///
+    /// `any` has no AST node of its own; it is lowered losslessly to
+    /// `!expr.all(!pred)` here at the builder layer (exactly as `e1 >= e2` is
+    /// lowered to `!(e1 < e2)`), so it shares `all`'s evaluation semantics and
+    /// proofs. An empty set yields `false` (vacuous falsity); the deterministic
+    /// `QuantifierError` / no-short-circuit rules of [`Expr::all`] apply. Requires
+    /// the `anyall` feature.
     #[cfg(feature = "anyall")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "anyall")))]
     pub fn any(expr: Expr, pred: PredExpr) -> Self {
         Expr::not(Expr::all(expr, pred.negate()))
     }

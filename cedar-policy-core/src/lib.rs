@@ -57,6 +57,11 @@
 //!   [`batched_evaluator`] and [`tpe`] modules.
 //! - `partial-eval` — Partial evaluation of Cedar policies. You should prefer `tpe` above.
 //! - `partial-validate` — Partial validation of Cedar policies.
+//! - `anyall` — Non-nested set quantifiers `e.all(p)` / `e.any(p)` over the
+//!   element keyword `it`. The predicate `p` must be *set-free* and non-nested
+//!   (no set literals, no `contains`/`containsAll`/`containsAny`/`isEmpty`, no
+//!   nested quantifier); that restriction is what makes the operators analyzable
+//!   (Mohamed et al., FMCAD 2025). Off by default; included in `experimental`.
 //! - (deprecated) `entity-manifest` — Entity manifest computation for entity slicing.
 //!   This feature is deprecated; you should use `tpe` instead.
 //!

@@ -486,7 +486,26 @@ pub enum ValidationError {
     #[diagnostic(transparent)]
     InvalidEnumEntity(#[from] validation_errors::InvalidEnumEntity),
     /// Returned when the predicate of a `.all`/`.any` set quantifier contains a
-    /// set-typed expression
+    /// set-typed expression.
+    ///
+    /// The non-nested set quantifiers `e.all(p)` / `e.any(p)` (feature `anyall`,
+    /// off by default) range over a set using the element keyword `it`; the
+    /// predicate `p` must be *set-free*. A valid quantifier policy parses through
+    /// the normal policy API:
+    ///
+    /// ```
+    /// use cedar_policy::Policy;
+    /// use std::str::FromStr;
+    ///
+    /// let policy = Policy::from_str(
+    ///     "permit(principal, action, resource) when { resource.ports.all(it > 0) };",
+    /// )
+    /// .expect("a set-free `.all` predicate parses");
+    /// # let _ = policy;
+    /// ```
+    ///
+    /// A predicate that uses a set-typed expression is rejected by the validator
+    /// with this error.
     #[cfg(feature = "anyall")]
     #[error(transparent)]
     #[diagnostic(transparent)]
