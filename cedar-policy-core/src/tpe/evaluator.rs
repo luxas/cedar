@@ -568,24 +568,33 @@ impl Evaluator<'_> {
                         expr: Arc::new(recv),
                         pred: pred.clone(),
                     }),
-                    // Concrete receiver: fold per element exactly like the
-                    // Phase-3 concrete evaluator (`evaluator.rs` `.all` arm):
-                    // non-set receiver => error; per element instantiate the
-                    // predicate and interpret it; any erroring/non-bool element
-                    // => QuantifierError image (`mk_error`); NO short-circuit on
-                    // a `false` element, because a later element may still error
-                    // (reqs 2.5/2.8); empty set => `true`. If any element's
-                    // predicate stays residual, conservatively keep the whole
-                    // node residual with the receiver rebuilt from its concrete
-                    // value so it is not re-folded (7.3's full per-element
-                    // refinement is deferred, D-80 / Phase 9).
+                    // Concrete receiver: refine the quantifier per element
+                    // (req 7.3 / D-80 full / D-92). Non-set receiver => error.
+                    // For each element, instantiate the predicate and interpret
+                    // it:
+                    //   * a concrete `true`  => the element is discharged (drop);
+                    //   * a concrete `false` => pin `decided_false` (the final
+                    //     value is `false` unless a pending element errors);
+                    //   * a concrete error / non-bool => the whole node is the
+                    //     `QuantifierError` image (`mk_error`), immediately
+                    //     (reqs 2.5/2.6);
+                    //   * a residual => keep it in `pending`.
+                    // There is NO short-circuit on a `false` element: every
+                    // element is interpreted, because a later element may still
+                    // error and that error outranks the pinned `false` (2.8).
+                    // After the loop: empty `pending` collapses to
+                    // `Concrete(!decided_false)` (the fold completed — all-true
+                    // => `true`, some-false => `false`); otherwise emit a refined
+                    // `AllPartial` carrying the pinned `false` and the undecided
+                    // elements (7.3). This supersedes the Phase-6.5 conservative
+                    // "keep the whole node" behaviour.
                     Residual::Concrete { value, .. } => {
                         let set = match value.get_as_set() {
                             Ok(set) => set,
                             Err(_) => return mk_error(),
                         };
-                        let mut all_true = true;
-                        let mut any_residual = false;
+                        let mut decided_false = false;
+                        let mut pending: Vec<Residual> = Vec::new();
                         for elem in set.iter() {
                             let inst = pred.instantiate(elem);
                             let elem_residual =
@@ -593,23 +602,62 @@ impl Evaluator<'_> {
                             match &elem_residual {
                                 Residual::Error(_) => return mk_error(),
                                 Residual::Concrete { value, .. } => match value.get_as_bool() {
-                                    Ok(b) => all_true &= b,
+                                    Ok(true) => {}             // discharged
+                                    Ok(false) => decided_false = true,
                                     // A non-boolean per-element result is a
                                     // QuantifierError, matching Lean/Rust (D-16).
                                     Err(_) => return mk_error(),
                                 },
-                                Residual::Partial { .. } => any_residual = true,
+                                Residual::Partial { .. } => pending.push(elem_residual),
                             }
                         }
-                        if any_residual {
-                            mk_residual(ResidualKind::All {
-                                expr: Arc::new(recv),
-                                pred: pred.clone(),
-                            })
+                        if pending.is_empty() {
+                            mk_concrete((!decided_false).into())
                         } else {
-                            mk_concrete(all_true.into())
+                            mk_residual(ResidualKind::AllPartial {
+                                decided_false,
+                                pending: Arc::new(pending),
+                            })
                         }
                     }
+                }
+            }
+            // A refined quantifier (D-92) is re-interpreted idempotently: each
+            // still-pending element predicate is interpreted again (an unknown
+            // it reads may now be known), applying the same per-element fold —
+            // newly-`true` elements drop, a newly-`false` element pins
+            // `decided_false`, an element error collapses the whole node to the
+            // `QuantifierError` image, and still-residual elements stay pending.
+            // No short-circuit (2.8). Empty `pending` collapses to
+            // `Concrete(!decided_false)`. This keeps a second TPE pass sound and
+            // monotone (a pending element can only become decided, never
+            // un-decided).
+            #[cfg(feature = "anyall")]
+            ResidualKind::AllPartial {
+                decided_false,
+                pending,
+            } => {
+                let mut decided_false = *decided_false;
+                let mut new_pending: Vec<Residual> = Vec::new();
+                for elem in pending.as_ref() {
+                    let elem_residual = self.interpret(elem);
+                    match &elem_residual {
+                        Residual::Error(_) => return mk_error(),
+                        Residual::Concrete { value, .. } => match value.get_as_bool() {
+                            Ok(true) => {}
+                            Ok(false) => decided_false = true,
+                            Err(_) => return mk_error(),
+                        },
+                        Residual::Partial { .. } => new_pending.push(elem_residual),
+                    }
+                }
+                if new_pending.is_empty() {
+                    mk_concrete((!decided_false).into())
+                } else {
+                    mk_residual(ResidualKind::AllPartial {
+                        decided_false,
+                        pending: Arc::new(new_pending),
+                    })
                 }
             }
         }
@@ -2966,15 +3014,17 @@ mod tests {
         }
 
         #[test]
-        fn concrete_receiver_residual_predicate_keeps_node() {
+        fn concrete_receiver_residual_predicate_refines() {
             // Concrete receiver, but the predicate reads an UNKNOWN request
-            // attribute (`resource.unknownish` via a residual sub-term): under
-            // D-80 option A, a residual per-element predicate conservatively
-            // keeps the whole node residual (7.3/7.4). Here the predicate
-            // compares `it` to `resource`'s (unknown) identity through `in`,
-            // which stays residual while `context.recs` is concrete.
-            // We keep the receiver concrete and make the predicate residual by
-            // referencing the unknown principal.
+            // value (`principal`) through `in`, so the per-element predicate
+            // stays residual. Under the Phase-6.5 conservative fold (D-80 A)
+            // this kept the WHOLE node (`[E::"x"].all(it in principal)`); under
+            // the req-7.3 / D-92 refinement it now REFINES to an `AllPartial`
+            // carrying only the undecided elements, re-expanded for
+            // reauthorization as `[<pending bools>, <!decided_false>].all(it)`.
+            // One concrete element whose predicate is residual, nothing yet
+            // decided `false`, so: pending = [`E::"x" in principal`],
+            // decided_false = false (marker `true`).
             let schema = parse_schema(
                 r#"entity E in E;
                    action a appliesTo {
@@ -2999,11 +3049,12 @@ mod tests {
                 entities: &PartialEntities::new(),
                 extensions: Extensions::all_available(),
             };
-            // `it in principal` with unknown principal => per-element predicate
-            // residual => whole node retained with the concrete receiver.
+            // Refined: the receiver is consumed, the single pending element
+            // predicate and the `true` (nothing-pinned) marker become set
+            // elements, quantified by the identity predicate `it`.
             assert_snapshot!(
                 interpret_typed_str_to_str(&eval, r#"context.es.all(it in principal)"#, &schema),
-                @r#"[E::"x"].all(it in principal)"#
+                @r#"[E::"x" in principal, true].all(it)"#
             );
         }
 

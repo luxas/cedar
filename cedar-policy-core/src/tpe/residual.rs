@@ -176,6 +176,14 @@ impl Residual {
                 // (D-80, risk R2).
                 #[cfg(feature = "anyall")]
                 ResidualKind::All { .. } => true,
+                // Like `All`: a refined-but-still-partial quantifier can raise
+                // a `QuantifierError` (a pending element can error or be
+                // non-boolean), so it is a runtime-error source regardless of
+                // the pinned `decided_false`. Reporting `false` would let a
+                // downstream `&&`/`||` simplifier drop a possibly-erroring node
+                // (D-80 risk R2 / D-92).
+                #[cfg(feature = "anyall")]
+                ResidualKind::AllPartial { .. } => true,
             },
         }
     }
@@ -556,6 +564,38 @@ pub enum ResidualKind {
         /// Set-free, non-nested predicate over the current element `it`.
         pred: Arc<ast::PredExpr>,
     },
+    /// Per-element-refined residual of a *concrete-receiver* `expr.all(pred)`
+    /// whose fold is partially complete (req 7.3 / D-80 full / D-92, FORK-3).
+    ///
+    /// Produced when the receiver interpreted to a `Concrete` set and the fold
+    /// discharged every element it could: concrete-`true` elements were
+    /// dropped, each concrete-`false` element pinned `decided_false`, a concrete
+    /// element error collapsed the whole node to `Error`, and every element
+    /// whose instantiated predicate stayed residual contributes one entry to
+    /// `pending`.
+    ///
+    /// Semantics (the invariant re-authorization must preserve, 2.5/2.8): the
+    /// node is a `QuantifierError` iff **any** `pending` element errors or is
+    /// non-boolean; otherwise its value is `true` iff `!decided_false` **and**
+    /// every `pending` element is `true`. There is **no** short-circuit on a
+    /// `false` (a pending element may still error, and that error outranks the
+    /// pinned `false`), which is exactly why the `decided_false` bit is carried
+    /// separately rather than folded into a `false` element — a filtered
+    /// receiver cannot represent it (D-92).
+    ///
+    /// INVARIANT: `pending` is non-empty (an empty `pending` collapses to
+    /// `Concrete(!decided_false)` in the fold, never reaching this variant).
+    #[cfg(feature = "anyall")]
+    AllPartial {
+        /// Whether some already-decided element evaluated to a concrete
+        /// `false`. When `true`, the final value is `false` unless a `pending`
+        /// element errors first (the error outranks the `false`).
+        decided_false: bool,
+        /// The per-element predicate residuals for elements not yet decided.
+        /// Each is a boolean-valued residual; the fold could not reduce it
+        /// because it reads an unknown. Non-empty by the invariant above.
+        pending: Arc<Vec<Residual>>,
+    },
 }
 
 impl ResidualKind {
@@ -617,6 +657,18 @@ impl ResidualKind {
             ResidualKind::All { expr, pred } => {
                 let mut uids = expr.all_literal_uids();
                 uids.extend(pred_literal_uids(pred));
+                uids
+            }
+            // Each pending element is a fully-instantiated predicate residual,
+            // which may name literal entity UIDs; surface them all so
+            // reauthorization loads every entity the refined `.all` references
+            // (mirrors the `All` arm, D-80 risk R3).
+            #[cfg(feature = "anyall")]
+            ResidualKind::AllPartial { pending, .. } => {
+                let mut uids = HashSet::new();
+                for p in pending.as_ref() {
+                    uids.extend(p.all_literal_uids());
+                }
                 uids
             }
         }
@@ -746,6 +798,44 @@ impl From<Residual> for Expr {
                     #[cfg(feature = "anyall")]
                     ResidualKind::All { expr, pred } => {
                         builder.all(expr.as_ref().clone().into(), pred.as_ref().clone())
+                    }
+                    // Re-expand a per-element-refined quantifier (D-92) back
+                    // into a form the concrete evaluator reauthorizes with
+                    // exactly the `.all` semantics the fold preserved: build the
+                    // literal set of the pending element booleans (plus a
+                    // `!decided_false` marker element that pins an
+                    // already-decided `false`) and quantify it with the identity
+                    // predicate `it`.
+                    //
+                    // `[<p1>, …, <pn>, <!decided_false>].all(it)` evaluates
+                    // every element eagerly (so a pending element that errors
+                    // makes the whole expression error — the QuantifierError
+                    // image, kind-free per D-80), then folds with NO
+                    // short-circuit on a `false` (built into `.all`), yielding
+                    // `true` iff `!decided_false` and every pending element is
+                    // `true`. This reuses the one operator whose
+                    // no-short-circuit + deterministic-`QuantifierError`
+                    // semantics are already the spec, so the re-authorized
+                    // residual agrees with full `.all` evaluation on completed
+                    // input (the TPE soundness invariant, D-81/D-92).
+                    #[cfg(feature = "anyall")]
+                    ResidualKind::AllPartial {
+                        decided_false,
+                        pending,
+                    } => {
+                        let mut elems: Vec<Expr> = pending
+                            .as_ref()
+                            .clone()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect();
+                        // The marker element: `true` when nothing is pinned
+                        // (identity for the conjunction), `false` when some
+                        // element already evaluated to `false`.
+                        elems.push(builder.clone().val(!decided_false));
+                        let it_pred = ast::PredExprBuilder::<()>::new().item();
+                        let set_expr = builder.clone().set(elems);
+                        builder.all(set_expr, it_pred)
                     }
                 }
             }
