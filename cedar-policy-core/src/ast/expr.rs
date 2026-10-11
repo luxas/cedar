@@ -807,6 +807,7 @@ impl Expr {
     /// error outranks a `false`, evaluation does **not** short-circuit on the
     /// first `false` element. Requires the `anyall` feature.
     #[cfg(feature = "anyall")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "anyall")))]
     pub fn all(expr: Expr, pred: PredExpr) -> Self {
         use crate::expr_builder::ExprBuilder as _;
         ExprBuilder::new().all(expr, pred)
@@ -822,6 +823,7 @@ impl Expr {
     /// `QuantifierError` / no-short-circuit rules of [`Expr::all`] apply. Requires
     /// the `anyall` feature.
     #[cfg(feature = "anyall")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "anyall")))]
     pub fn any(expr: Expr, pred: PredExpr) -> Self {
         Expr::not(Expr::all(expr, pred.negate()))
     }
